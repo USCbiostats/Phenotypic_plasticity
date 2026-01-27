@@ -1,0 +1,208 @@
+---
+title: "TSS_gene_mapping"
+output: html_document
+date: "2025-12-17"
+---
+
+```{r}
+library(data.table)
+
+# 1) SCP259 genes
+scp259_genes <- unique(scp259_expr_Healthy$gene)
+
+# 2) make sure refseq_all is data.table
+ref <- as.data.table(refseq_all)
+
+# 3) normalize column names (handles chrom vs chr)
+if (!("chr" %in% names(ref)) && ("chrom" %in% names(ref))) ref[, chr := chrom]
+stopifnot(all(c("chr","txStart","txEnd","name2") %in% names(ref)))
+
+# 4) filter to SCP259 genes present in refseq_all (gene symbol in name2)
+ref_scp <- ref[name2 %chin% scp259_genes & !is.na(txStart) & !is.na(chr)]
+
+
+# choose whether to include strand in the "same TSS" definition
+USE_STRAND <- TRUE
+
+keys <- if (USE_STRAND && "strand" %in% names(ref_scp)) c("chr","strand","txStart") else c("chr","txStart")
+
+txstart_groups <- ref_scp[
+  , .(
+    n_tx   = .N,                       # number of transcripts/rows
+    n_genes = uniqueN(name2),          # number of distinct genes
+    genes   = paste(sort(unique(name2)), collapse = ", ")
+  ),
+  by = keys
+][order(-n_genes, -n_tx)]
+
+
+```
+
+```{r}
+shared_txstart <- txstart_groups[n_genes >= 2]
+
+# count of shared sites
+n_shared_sites <- nrow(shared_txstart)
+
+# list of the shared sites + genes
+shared_txstart[]
+
+```
+```{r}
+library(data.table)
+
+scp259_genes <- scp259_expr_Healthy$gene
+ref_scp <- as.data.table(refseq_all)[
+  !is.na(name2) & name2 %in% scp259_genes &
+  !is.na(chrom) & !is.na(txStart) & !is.na(txEnd) & txEnd >= txStart
+]
+
+multi_chr <- ref_scp[
+  , .(
+    n_chr = uniqueN(chrom),
+    chrs  = paste(sort(unique(chrom)), collapse = ","),
+    n_tx  = .N
+  ),
+  by = .(gene = name2)
+][n_chr > 1][order(-n_chr, -n_tx)]
+
+multi_chr[]
+
+
+```
+
+
+
+```{r}
+tss500 <- ref_scp[
+  , .(
+    chr,
+    start = pmax(1L, as.integer(txStart) - 500L),
+    end   = as.integer(txStart) + 500L,
+    gene  = name2
+  )
+]
+
+# keep sane intervals
+tss500 <- tss500[!is.na(start) & !is.na(end) & end >= start]
+setkey(tss500, chr, start, end)
+
+# Use GenomicRanges for a clean reduce + mapping
+suppressPackageStartupMessages({
+  library(GenomicRanges)
+  library(IRanges)
+})
+
+gr <- GRanges(
+  seqnames = tss500$chr,
+  ranges   = IRanges(start = tss500$start, end = tss500$end),
+  gene     = tss500$gene
+)
+
+gr_red <- reduce(gr)  # merged intervals
+
+# map each original window to a reduced interval
+hits <- findOverlaps(gr, gr_red)
+map_dt <- data.table(
+  gene = mcols(gr)$gene[queryHits(hits)],
+  red_id = subjectHits(hits)
+)
+
+# how many genes per reduced interval?
+red_gene_counts <- map_dt[, .(n_genes = uniqueN(gene), n_windows = .N), by = red_id]
+merged_red <- red_gene_counts[n_genes >= 2][order(-n_genes, -n_windows)]
+merged_red[]
+
+```
+
+
+```{r}
+# self overlap join to enumerate overlapping window pairs
+x <- copy(tss500)
+x[, id := .I]
+setkey(x, chr, start, end)
+
+ov <- foverlaps(
+  x, x,
+  by.x = c("chr","start","end"),
+  by.y = c("chr","start","end"),
+  type = "any",
+  nomatch = 0L
+)
+
+# drop self-pairs + de-duplicate symmetric pairs
+ov <- ov[id < i.id]
+
+# compute overlap bp
+ov[, ov_bp := pmin(end, i.end) - pmax(start, i.start) + 1L]
+ov <- ov[ov_bp > 0]
+
+# overlap fraction relative to window length (should be 1001 if txStart is 1-based)
+WIN_LEN <- 1001L
+ov[, ov_frac := ov_bp / WIN_LEN]
+
+# distribution summaries
+overlap_summary <- ov[, .(
+  n_pairs = .N,
+  ov_bp_min = min(ov_bp),
+  ov_bp_median = median(ov_bp),
+  ov_bp_mean = mean(ov_bp),
+  ov_bp_max = max(ov_bp),
+  ov_frac_median = median(ov_frac),
+  ov_frac_mean = mean(ov_frac)
+)]
+overlap_summary
+
+```
+
+
+```{r}
+ov_bins <- ov[
+  , .N,
+  by = .(bin = cut(ov_frac,
+                  breaks = c(0, 0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99, 1.0),
+                  include.lowest = TRUE))
+][order(bin)]
+
+ov_bins[]
+
+ggplot(ov, aes(x = ov_frac)) +
+  geom_histogram(bins = 50) +
+  labs(x = "Overlap fraction of TSS±500 windows", y = "# overlapping pairs",
+       title = "Distribution of overlap between SCP259 TSS±500 windows") +
+  theme_bw()
+
+```
+```{r}
+library(data.table)
+
+scp259_genes <- scp259_expr_Healthy$gene
+
+ref_scp <- as.data.table(refseq_all)[
+  !is.na(name2) & name2 %in% scp259_genes &
+  !is.na(chrom) & !is.na(txStart) & !is.na(txEnd) & txEnd >= txStart
+]
+
+## define what a "transcript" is (for counting), WITHOUT keeping transcript names
+if ("name" %in% names(ref_scp)) {
+  # use transcript ID internally for counting only
+  ref_scp[, tx_key := as.character(name)]
+} else {
+  # fallback: treat each unique (chrom,strand,txStart,txEnd) as a transcript record
+  ref_scp[, tx_key := paste(chrom, strand, txStart, txEnd, sep = ":")]
+}
+
+## (A) Gene-level summary: genes with multiple transcripts + their txStart set
+multi_tx_txstart <- ref_scp[
+  , .(
+    n_tx            = uniqueN(tx_key),
+    n_unique_txStart = uniqueN(txStart),
+    txStarts        = paste(sort(unique(txStart)), collapse = ",")
+  ),
+  by = .(gene = name2)
+][n_tx > 1][order(-n_tx, -n_unique_txStart)]
+
+multi_tx_txstart[]
+
+```
+

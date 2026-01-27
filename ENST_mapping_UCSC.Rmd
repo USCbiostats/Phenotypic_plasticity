@@ -1,0 +1,293 @@
+---
+title: "ENST_mapping_UCSC"
+output: html_document
+date: "2025-11-06"
+---
+
+
+```{r}
+## ------------------------------------------------------------
+## Setup (UCSC-only)
+## ------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(glue)
+  library(tibble)
+  library(stringr)
+})
+
+f_known <- "data/ucsc_hg38_gene_known_genecodeV48"         # your starting file (ENST-based)
+# Optional: your *target* for QC only (not used to build)
+f_target <- "data/ucsc_hg38_gene_known_RefSeqALL.txt"
+
+## Helper to download UCSC tables if missing
+ucsc_db <- "http://hgdownload.soe.ucsc.edu/goldenPath/hg38/database"
+maybe_get <- function(fname) {
+  gz <- paste0(fname, ".gz")
+  if (!file.exists(fname)) {
+    message("Downloading ", gz)
+    download.file(paste0(ucsc_db, "/", gz), destfile = gz, mode = "wb", quiet = TRUE)
+    R.utils::gunzip(gz, overwrite = TRUE, remove = FALSE)
+  }
+}
+
+## We need three UCSC tables: knownToRefSeq, refGene, ncbiRefSeq
+suppressWarnings(suppressMessages({
+  if (!requireNamespace("R.utils", quietly = TRUE)) install.packages("R.utils")
+}))
+maybe_get("knownToRefSeq.txt")
+maybe_get("refGene.txt")
+maybe_get("ncbiRefSeq.txt")
+
+## ------------------------------------------------------------
+## 1) Read your known/GENCODE table (ENST) and normalize
+## ------------------------------------------------------------
+
+detect_enst_col <- function(df) {
+  # score each column by how many values look like ENSTxxxx(.y)
+  scores <- vapply(names(df), function(cn) {
+    x <- df[[cn]]
+    if (!is.atomic(x)) return(0L)
+    sum(stringr::str_detect(as.character(x), "^ENST\\d+(?:\\.\\d+)?$"), na.rm = TRUE)
+  }, integer(1))
+  if (length(scores) == 0 || max(scores, na.rm = TRUE) == 0) return(NA_character_)
+  names(scores)[which.max(scores)]
+}
+
+read_known_enst <- function(path) {
+  df <- data.table::fread(path, sep = "\t", header = TRUE, quote = "", na.strings = c("", "NA")) |>
+    tibble::as_tibble()
+
+  # normalize any BOM on names (e.g., "ï..#name")
+  names(df) <- sub("^\ufeff", "", names(df))
+
+  # try to rename a header that looks like "#name" (case-insensitive, with/without '#')
+  hit <- grep("^#?name$", names(df), ignore.case = TRUE)
+  if (length(hit) == 1L) {
+    names(df)[hit] <- "name"
+  }
+
+  # if we still don't have 'name', auto-detect the ENST column by regex
+  if (!"name" %in% names(df)) {
+    scores <- vapply(df, function(x)
+      sum(stringr::str_detect(as.character(x), "^ENST\\d+(?:\\.\\d+)?$"), na.rm = TRUE),
+      integer(1))
+    if (max(scores, na.rm = TRUE) == 0) {
+      stop("Could not find an ENST-like column in: ", path)
+    }
+    enst_col <- names(df)[which.max(scores)]
+    df <- dplyr::rename(df, name = !!enst_col)
+  }
+
+  df |>
+    dplyr::mutate(name = sub("\\.\\d+$", "", name)) |>
+    dplyr::distinct(name, .keep_all = TRUE)
+}
+
+## ---- use it
+f_known <- "data/ucsc_hg38_gene_known_genecodeV48"
+known_dt <- read_known_enst(f_known)
+
+cat(sprintf("Rows in known_dt: %d | Unique ENST (version-stripped): %d\n",
+            nrow(known_dt), dplyr::n_distinct(known_dt$name)))
+
+# quick peek (explicit dplyr to avoid masking)
+known_dt %>%
+  dplyr::slice_head(n = 5) %>%
+  dplyr::select(name, dplyr::any_of(c("chrom","strand"))) %>%
+  print()
+
+```
+
+
+```{r}
+## ------------------------------------------------------------
+## 2) Read UCSC mapping: ENST/knownGene -> RefSeq
+##    knownToRefSeq has cols: kgID, value
+## ------------------------------------------------------------
+k2rs <- fread("knownToRefSeq.txt", header = FALSE, sep = "\t",
+              col.names = c("kgID","refseq_id")) %>%
+  as_tibble() %>%
+  mutate(
+    kgID      = sub("\\.\\d+$","", kgID),
+    refseq_id = sub("\\.\\d+$","", refseq_id)
+  ) %>%
+  filter(grepl("^(NM|NR|XM|XR)_", refseq_id)) %>%
+  distinct()
+
+## ENST → RefSeq (many-to-many)
+ens_to_refseq <- known_dt %>%
+  dplyr::select(enst = name) %>%
+  left_join(k2rs, by = c("enst" = "kgID")) %>%
+  filter(!is.na(refseq_id)) %>%
+  distinct()
+
+## ------------------------------------------------------------
+## 3) Build a RefSeqALL universe from UCSC coordinates
+##    (curated refGene + predicted/curated ncbiRefSeq)
+##    Schema matches your target: name chrom strand txStart txEnd cdsStart cdsEnd exonCount exonStarts exonEnds score name2 ...
+## ------------------------------------------------------------
+read_ref_like <- function(path) {
+  # refGene/ncbiRefSeq have 16 columns; use friendly names
+  fread(path, header = FALSE, sep = "\t", quote = "", na.strings = c("", "NA"),
+        col.names = c("bin","name","chrom","strand","txStart","txEnd","cdsStart","cdsEnd",
+                      "exonCount","exonStarts","exonEnds","score","name2","cdsStartStat","cdsEndStat","exonFrames")) %>%
+    as_tibble() %>%
+    mutate(name = sub("\\.\\d+$","", name))
+}
+refGene_tbl   <- read_ref_like("refGene.txt")
+ncbiRefSeq_tbl<- read_ref_like("ncbiRefSeq.txt")
+
+refseq_all <- bind_rows(refGene_tbl, ncbiRefSeq_tbl) %>%
+  filter(grepl("^(NM|NR|XM|XR)_", name)) %>%
+  arrange(name, chrom, txStart) %>%
+  distinct(name, .keep_all = TRUE)  # keep first if duplicated per accession
+
+## ------------------------------------------------------------
+## 4) Join: ENST→RefSeq onto RefSeqALL coordinates
+## ------------------------------------------------------------
+refseq_mapped <- ens_to_refseq %>%
+  left_join(refseq_all, by = c("refseq_id" = "name")) %>%
+  # keep only rows where we found coordinates
+  filter(!is.na(chrom)) %>%
+  transmute(
+    name  = refseq_id,
+    chrom, strand, txStart, txEnd, cdsStart, cdsEnd,
+    exonCount, exonStarts, exonEnds,
+    score, name2, cdsStartStat, cdsEndStat, exonFrames,
+    enst
+  ) %>%
+  distinct()
+```
+
+
+```{r}
+## ------------------------------------------------------------
+## 5) QC: compare to your target (IDs only) — BOM/#bin safe
+## ------------------------------------------------------------
+if (file.exists(f_target)) {
+  target <- data.table::fread(
+    f_target, sep = "\t", header = TRUE, quote = "", na.strings = c("", "NA")
+  ) |>
+    tibble::as_tibble()
+
+  ## normalize header names
+  names(target) <- sub("^\ufeff", "", names(target))             # strip BOM
+  hit_bin  <- grep("^#?bin$",  names(target), ignore.case = TRUE)
+  hit_name <- grep("^#?name$", names(target), ignore.case = TRUE)
+  if (length(hit_bin)  == 1L) names(target)[hit_bin]  <- "bin"
+  if (length(hit_name) == 1L) names(target)[hit_name] <- "name"
+
+  target <- target |>
+    dplyr::mutate(name = sub("\\.\\d+$", "", name)) |>
+    dplyr::distinct(name, .keep_all = TRUE)
+
+  ## accession sets
+  ids_mapped <- unique(refseq_mapped$name)         # ENST-anchored (many-to-many)
+  ids_all    <- unique(refseq_all$name)            # UCSC union (one per accession)
+  ids_target <- unique(target$name)
+
+  ov_map_tgt <- length(intersect(ids_mapped, ids_target))
+  ov_all_tgt <- length(intersect(ids_all,    ids_target))
+
+  cat(glue::glue("
+Built rows (ours, ENST-anchored): {nrow(refseq_mapped)}
+Unique RefSeq (ours, ENST-anchored): {length(ids_mapped)}
+Unique RefSeq (ours, UCSC union):    {length(ids_all)}
+Target unique RefSeq:                {length(ids_target)}
+
+ID overlap (ENST-anchored ∩ target): {ov_map_tgt}
+  • {round(100*ov_map_tgt/length(ids_mapped),1)}% of our ENST-anchored
+  • {round(100*ov_map_tgt/length(ids_target),1)}% of target
+
+ID overlap (UCSC union ∩ target):    {ov_all_tgt}
+  • {round(100*ov_all_tgt/length(ids_all),1)}% of UCSC union
+  • {round(100*ov_all_tgt/length(ids_target),1)}% of target
+"))
+}
+
+## If you want just the RefSeqALL table for all accessions (not only those reachable from your ENST set):
+## write_tsv(refseq_all %>% select(-bin), "RefSeqALL_UCSC_union.tsv")
+## And your ENST-anchored subset:
+## write_tsv(refseq_mapped %>% select(-score), "RefSeqALL_from_knownGene.tsv")
+
+```
+```{r}
+suppressPackageStartupMessages({
+  library(rtracklayer)
+  library(data.table)
+  library(dplyr)
+  library(stringr)
+  library(tibble)
+  library(glue)
+})
+
+## ---------- helpers
+normalize_refseq <- function(x) {
+  x <- x[!is.na(x)]
+  x <- toupper(trimws(as.character(x)))
+  sub("\\.\\d+$", "", x)  # strip version
+}
+
+read_target_ids <- function(path) {
+  tgt <- data.table::fread(path, sep = "\t", header = TRUE, quote = "", na.strings = c("", "NA")) |>
+    tibble::as_tibble()
+  # fix headers (BOM/#bin/#name)
+  names(tgt) <- sub("^\ufeff", "", names(tgt))
+  hit_bin  <- grep("^#?bin$",  names(tgt), ignore.case = TRUE)
+  hit_name <- grep("^#?name$", names(tgt), ignore.case = TRUE)
+  if (length(hit_bin)  == 1L) names(tgt)[hit_bin]  <- "bin"
+  if (length(hit_name) == 1L) names(tgt)[hit_name] <- "name"
+  normalize_refseq(unique(tgt$name))
+}
+
+## ---------- A) IDs from UCSC union you already built
+# refseq_all is the union of refGene + ncbiRefSeq with one row per accession
+ids_ucsc_union <- normalize_refseq(unique(refseq_all$name))
+
+## ---------- B) IDs from NCBI GTF
+gtf_path <- "data/hg38.ncbiRefSeq.gtf.gz"   # or the unzipped .gtf
+gr_all   <- rtracklayer::import(gtf_path)
+ids_ncbi <- mcols(gr_all)$transcript_id
+ids_ncbi <- ids_ncbi[!is.na(ids_ncbi)]
+ids_ncbi <- ids_ncbi[stringr::str_detect(ids_ncbi, stringr::regex("^(NM|NR|XM|XR)_", ignore_case = TRUE))]
+ids_ncbi <- normalize_refseq(unique(ids_ncbi))
+
+## ---------- C) IDs from your target file (for QC)
+ids_target <- if (file.exists(f_target)) read_target_ids(f_target) else character(0)
+
+## ---------- Overlaps
+ov_all_ncbi   <- length(intersect(ids_ucsc_union, ids_ncbi))
+ov_ncbi_tgt   <- if (length(ids_target)) length(intersect(ids_ncbi, ids_target)) else NA_integer_
+
+cat(glue("
+--- ID overlap (version-stripped) ---
+UCSC union RefSeq IDs: {length(ids_ucsc_union)}
+NCBI GTF RefSeq IDs:   {length(ids_ncbi)}
+Target RefSeq IDs:      {if (length(ids_target)) length(ids_target) else 0}
+
+Overlap (UCSC union ∩ NCBI): {ov_all_ncbi}
+  • {round(100*ov_all_ncbi/length(ids_ucsc_union),1)}% of UCSC union
+  • {round(100*ov_all_ncbi/length(ids_ncbi),1)}% of NCBI
+
+{if (length(ids_target)) glue('Overlap (NCBI ∩ Target): {ov_ncbi_tgt}
+  • {round(100*ov_ncbi_tgt/length(ids_ncbi),1)}% of NCBI
+  • {round(100*ov_ncbi_tgt/length(ids_target),1)}% of Target
+') else ''}
+"))
+
+```
+```{r}
+suppressPackageStartupMessages({ library(readr) })
+
+# 1) R-native (keeps types exactly; fastest to reload)
+saveRDS(refseq_all, file = "data/refseq_all.rds")
+
+# 2) Portable TSV (human-readable; slightly larger)
+readr::write_tsv(refseq_all, file = "data/refseq_all.tsv")
+
+```
+

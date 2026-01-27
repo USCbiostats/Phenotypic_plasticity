@@ -1,0 +1,1192 @@
+---
+title: "Expression_Phenotypic"
+output: html_document
+date: "2025-12-10"
+---
+
+```{r}
+## ============================================================
+## SCP259: build expression tables from raw MTX + metadata
+## ============================================================
+library(Matrix)
+library(data.table)
+
+## epithelial clusters of interest (in "safe" form, like the Python output)
+EPI_TYPES_SAFE <- c(
+  "Best4_Enterocytes",
+  "Cycling_TA",
+  "Enterocyte_Progenitors",
+  "Enterocytes",
+  "Enteroendocrine",
+  "Goblet",
+  "Immature_Enterocytes_1",
+  "Immature_Enterocytes_2",
+  "Immature_Goblet",
+  "M_cells",
+  "Secretory_TA",
+  "Stem",
+  "TA_1",
+  "TA_2",
+  "Tuft"
+)
+
+pairs <- list(
+  "Normal EN–IN" = c("EN","IN"),
+  "Normal EN–JN" = c("EN","JN"),
+  "Normal IN–JN" = c("IN","JN"),
+  "Adenoma PA–PB"= c("PA","PB"),
+  "Adenoma SA–SB"= c("SA","SB"),
+  "Adenoma XA–XB"= c("XA","XB"),
+  "CRC DA–DB"    = c("DA","DB"),
+  "CRC EA–EB"    = c("EA","EB"),
+  "CRC FA–FB"    = c("FA","FB"),
+  "CRC HA–HB"    = c("HA","HB"),
+  "CRC IA–IB"    = c("IA","IB"),
+  "CRC JA–JB"    = c("JA","JB"),
+  "CRC KA–KB"    = c("KA","KB"),
+  "CRC MA–MB"    = c("MA","MB")
+)
+
+
+## same "safe" function as in the Python script
+safe_name <- function(s) {
+  gsub("[^A-Za-z0-9._-]+", "_", s)
+}
+
+## ---- collapse duplicated genes: sum rows before normalization ----
+collapse_rows_by_gene <- function(A, genes) {
+  stopifnot(nrow(A) == length(genes))
+  f <- factor(genes)
+  if (nlevels(f) == length(genes)) {
+    return(list(A = A, genes = genes))  # already unique
+  }
+
+  message("Collapsing duplicated genes: ",
+          length(genes), " rows -> ", nlevels(f), " unique genes")
+
+  # sparse mapping matrix: (n_unique x n_original)
+  M <- Matrix::sparseMatrix(
+    i = as.integer(f),
+    j = seq_along(f),
+    x = 1,
+    dims = c(nlevels(f), length(f))
+  )
+
+  A2 <- M %*% A
+  genes2 <- levels(f)
+
+  list(A = as(A2, "dgCMatrix"), genes = genes2)
+}
+
+
+## ---- 1. read gene, cell, metadata dictionaries --------------------------
+read_scp259_dicts <- function(base_dir) {
+  gene_file <- file.path(base_dir, "Epi.genes.tsv")
+  barc_file <- file.path(base_dir, "Epi.barcodes2.tsv")
+  meta_file <- file.path(base_dir, "all.meta2.txt")
+  
+  genes <- readLines(gene_file, warn = FALSE)
+  cells <- readLines(barc_file, warn = FALSE)
+  
+  # parse meta line-by-line like the Python code (skip 2 header lines)
+  lines <- readLines(meta_file, warn = FALSE)
+  if (length(lines) <= 2L)
+    stop("META file has <=2 lines – unexpected format.")
+  lines <- lines[-c(1, 2)]   # drop 2 header-ish lines
+  
+  parts <- strsplit(lines, "\t", fixed = TRUE)
+  keep  <- vapply(parts, function(a) length(a) >= 6 && nzchar(a[1]), logical(1))
+  parts <- parts[keep]
+  
+  name   <- vapply(parts, `[[`, character(1), 1)  # NAME
+  clust  <- vapply(parts, `[[`, character(1), 2)  # Cluster
+  health <- vapply(parts, `[[`, character(1), 6)  # Health
+  
+  cell2type   <- setNames(clust,  name)
+  cell2health <- setNames(health, name)
+  
+  list(
+    genes       = genes,
+    cells       = cells,
+    cell2type   = cell2type,
+    cell2health = cell2health
+  )
+}
+
+## ---- 2. compute mean log2(TP10k+1) per gene × celltype for one group ----
+compute_group_matrix <- function(A, genes, cells,
+                                 cell2type, cell2health,
+                                 health_group = c("Healthy", "UC"),
+                                 epi_types_safe = EPI_TYPES_SAFE) {
+  health_group <- match.arg(health_group)
+  
+  # map each barcode to (cluster, health)
+  clust_raw   <- unname(cell2type[cells])
+  health_raw  <- unname(cell2health[cells])
+  clust_safe  <- safe_name(clust_raw)
+  
+  # define UC-like vs Healthy
+  if (health_group == "Healthy") {
+    mask <- !is.na(health_raw) & health_raw == "Healthy"
+  } else {
+    mask <- !is.na(health_raw) & health_raw != "Healthy"
+  }
+  # epithelial only
+  mask <- mask & !is.na(clust_safe) & clust_safe %in% epi_types_safe
+  
+  idx <- which(mask)
+  cat(
+    sprintf("Cells in %s epithelial group: %d\n",
+            health_group, length(idx))
+  )
+  if (!length(idx))
+    stop("No cells for group: ", health_group)
+  
+  A_sub <- A[, idx, drop = FALSE]  # genes × cells
+  clust_sub_safe <- clust_safe[idx]
+  
+  # library size per cell
+  lib <- Matrix::colSums(A_sub)
+  lib[lib == 0] <- 1
+  
+  # scale to TP10k, staying sparse: for each nonzero entry in column j, multiply by 1e4/lib[j]
+  A_t <- as(A_sub, "dgTMatrix")
+  scale_vec <- 1e4 / lib
+  A_t@x <- A_t@x * scale_vec[A_t@j + 1L]
+  TP <- as(A_t, "dgCMatrix")
+  
+  # log2(TP10k + 1) on non-zeros only
+  TP@x <- log2(TP@x + 1)
+  
+  # mean per gene per epithelial cell type
+  ctypes <- sort(unique(clust_sub_safe))
+  ctypes <- ctypes[ctypes %in% epi_types_safe]
+  
+  if (!length(ctypes))
+    stop("No epithelial cell types found for group: ", health_group)
+  
+  means <- matrix(NA_real_, nrow = nrow(TP), ncol = length(ctypes))
+  rownames(means) <- genes
+  colnames(means) <- ctypes
+  
+  for (k in seq_along(ctypes)) {
+    cols_k <- which(clust_sub_safe == ctypes[k])
+    if (!length(cols_k)) next
+    means[, k] <- Matrix::rowMeans(TP[, cols_k, drop = FALSE])
+  }
+  
+  expr_dt <- as.data.table(means)
+  expr_dt[, gene := genes]
+  setcolorder(expr_dt, c("gene", ctypes))
+  
+  expr_dt
+}
+
+
+
+## ---- 3. top-level wrapper for SCP259 -----------------------------------
+build_SCP259_tables <- function(base_dir = "data/SCP259") {
+  mtx_file <- file.path(base_dir, "gene_sorted-Epi.matrix.mtx")
+
+  dicts <- read_scp259_dicts(base_dir)
+  genes <- dicts$genes
+  cells <- dicts$cells
+
+  cat("Reading sparse matrix...\n")
+  A <- readMM(mtx_file)
+  A <- as(A, "dgCMatrix")
+
+  if (nrow(A) != length(genes) || ncol(A) != length(cells)) {
+    stop(sprintf(
+      "Shape mismatch: matrix %d×%d vs genes %d / cells %d",
+      nrow(A), ncol(A), length(genes), length(cells)
+    ))
+  }
+
+  ## NEW: collapse transcript rows -> gene rows
+  collapsed <- collapse_rows_by_gene(A, genes)
+  A <- collapsed$A
+  genes <- collapsed$genes
+
+  # Healthy group
+  expr_H <- compute_group_matrix(
+    A, genes, cells,
+    cell2type   = dicts$cell2type,
+    cell2health = dicts$cell2health,
+    health_group = "Healthy"
+  )
+
+  # UC-like group
+  expr_UC <- compute_group_matrix(
+    A, genes, cells,
+    cell2type   = dicts$cell2type,
+    cell2health = dicts$cell2health,
+    health_group = "UC"
+  )
+
+  mat_H  <- as.matrix(expr_H[, -1, with = FALSE])
+  mat_UC <- as.matrix(expr_UC[, -1, with = FALSE])
+
+  stats_dt <- data.table(
+    gene                = expr_H$gene,
+    mean_SCP259_Healthy = rowMeans(mat_H,  na.rm = TRUE),
+    var_SCP259_Healthy  = apply(mat_H,  1L, var, na.rm = TRUE),
+    mean_SCP259_UC      = rowMeans(mat_UC, na.rm = TRUE),
+    var_SCP259_UC       = apply(mat_UC, 1L, var, na.rm = TRUE)
+  )
+
+  list(
+    expr_by_celltype_Healthy = expr_H,
+    expr_by_celltype_UC      = expr_UC,
+    stats_per_gene           = stats_dt
+  )
+}
+
+
+```
+
+
+```{r}
+
+scp259_res   <- build_SCP259_tables("data/SCP259")
+
+scp259_expr_Healthy <- scp259_res$expr_by_celltype_Healthy
+scp259_expr_UC      <- scp259_res$expr_by_celltype_UC
+scp259_stats        <- scp259_res$stats_per_gene
+
+head(scp259_expr_Healthy)  # gene × epithelial cell types, Healthy
+head(scp259_expr_UC)       # gene × epithelial cell types, UC-like
+head(scp259_stats)         # gene, mean/var across epithelial types in each group
+
+```
+```{r}
+scp259_stats_rank <- scp259_stats[order(scp259_stats$var_SCP259_Healthy, decreasing = TRUE), ]
+head(scp259_stats_rank)
+
+```
+
+```{r}
+library(data.table)
+
+EPI_TYPES_SAFE <- c(
+  "Best4_Enterocytes","Cycling_TA","Enterocyte_Progenitors","Enterocytes",
+  "Enteroendocrine","Goblet","Immature_Enterocytes_1","Immature_Enterocytes_2",
+  "Immature_Goblet","M_cells","Secretory_TA","Stem","TA_1","TA_2","Tuft"
+)
+
+safe_name <- function(s) gsub("[^A-Za-z0-9._-]+", "_", s)
+
+summarise_SCP259_subjects <- function(base_dir = "data/SCP259") {
+  meta_file <- file.path(base_dir, "all.meta2.txt")
+  lines <- readLines(meta_file, warn = FALSE)
+  if (length(lines) <= 2L) stop("META file has <= 2 lines")
+
+  # drop first two header/type lines (same trick as before)
+  lines <- lines[-c(1, 2)]
+  parts <- strsplit(lines, "\t", fixed = TRUE)
+  keep  <- vapply(parts, function(a) length(a) >= 7 && nzchar(a[1]), logical(1))
+  parts <- parts[keep]
+
+  NAME    <- vapply(parts, `[[`, character(1), 1)  # cell barcode
+  Cluster <- vapply(parts, `[[`, character(1), 2)  # cell type
+  Subject <- vapply(parts, `[[`, character(1), 5)  # subject ID
+  Health  <- vapply(parts, `[[`, character(1), 6)  # Healthy / UC / etc
+
+  dt <- data.table(
+    cell    = NAME,
+    cluster = safe_name(Cluster),
+    subject = Subject,
+    health  = Health
+  )
+
+  # epithelial only
+  dt_epi <- dt[cluster %in% EPI_TYPES_SAFE]
+
+  ## (a) cells per subject overall
+  subj_overall <- dt_epi[, .(n_cells = .N), by = .(subject, health)][order(health, subject)]
+
+  ## (b) cells per (subject, epithelial cell type)
+  subj_celltype <- dt_epi[, .(n_cells = .N),
+                          by = .(subject, health, cluster)][order(health, cluster, subject)]
+
+  ## (c) summary per epithelial type: how many subjects, cells, etc.
+celltype_summary <- subj_celltype[
+  , .(
+      n_subjects               = as.integer(uniqueN(subject)),
+      total_cells              = as.integer(sum(n_cells)),
+      median_cells_per_subject = as.numeric(stats::median(as.numeric(n_cells))),
+      min_cells_per_subject    = as.numeric(min(n_cells)),
+      max_cells_per_subject    = as.numeric(max(n_cells))
+    ),
+  by = .(health, cluster)
+][order(health, cluster)]
+
+}
+
+## run
+scp259_subj <- summarise_SCP259_subjects("data/SCP259")
+
+scp259_subj
+
+```
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(GenomicRanges)
+  library(IRanges)
+  library(ggplot2)
+})
+
+## ---- helper: robust dt -> GRanges ----
+dt_to_gr <- function(dt, chr_col="chr", start_col="start", end_col="end", strand_col=NULL) {
+  stopifnot(all(c(chr_col, start_col, end_col) %in% names(dt)))
+  if (!is.null(strand_col) && strand_col %in% names(dt)) {
+    GRanges(
+      seqnames = dt[[chr_col]],
+      ranges   = IRanges(start = dt[[start_col]], end = dt[[end_col]]),
+      strand   = dt[[strand_col]]
+    )
+  } else {
+    GRanges(
+      seqnames = dt[[chr_col]],
+      ranges   = IRanges(start = dt[[start_col]], end = dt[[end_col]])
+    )
+  }
+}
+
+## ---- build gene TSS GRanges from UCSC refSeq-like table ----
+## expects refseq_all has: chrom/chr, txStart, txEnd, strand, name2 (gene symbol)
+build_refseq_tss_gr <- function(refseq_all) {
+  rs <- as.data.table(refseq_all)
+
+  # detect chrom column if not named "chr"
+  if (!("chr" %in% names(rs))) {
+    chr_col <- names(rs)[tolower(names(rs)) %in% c("chrom", "chr")][1]
+    if (is.na(chr_col)) stop("refseq_all: cannot find chrom/chr column")
+    setnames(rs, chr_col, "chr")
+  }
+
+  need <- c("chr", "txStart", "txEnd", "strand", "name2")
+  if (!all(need %in% names(rs))) {
+    stop("refseq_all is missing some required columns: ", paste(setdiff(need, names(rs)), collapse=", "))
+  }
+
+  # UCSC txStart is 0-based, txEnd is 1-based end.
+  # TSS (1-based coordinate):
+  #   + strand: txStart + 1
+  #   - strand: txEnd
+  rs <- rs[!is.na(name2) & name2 != "" & !is.na(txStart) & !is.na(txEnd)]
+  rs[, tss := fifelse(strand == "-", as.integer(txEnd), as.integer(txStart) + 1L)]
+
+  # keep transcript-level TSS (fine), or de-duplicate to one TSS per gene:
+  # choose the median tss among transcripts (stable, avoids huge transcript multiplicity)
+  gene_tss <- rs[, .(chr = chr[1], tss = as.integer(round(median(tss)))), by = name2]
+
+  gr <- GRanges(
+    seqnames = gene_tss$chr,
+    ranges   = IRanges(start = gene_tss$tss, end = gene_tss$tss),
+    strand   = "*"
+  )
+  mcols(gr)$gene_symbol <- gene_tss$name2
+  gr
+}
+
+## ---- map each interval to nearest gene TSS ----
+map_intervals_to_nearest_gene <- function(iv_dt, refseq_all) {
+  iv <- as.data.table(copy(iv_dt))
+  if (!("name" %in% names(iv))) {
+    # if your reduced intervals lack 'name', create one
+    iv[, name := paste0("ccre_", seq_len(.N))]
+  }
+
+  # GRanges for intervals
+  gr_iv <- dt_to_gr(iv, chr_col="chr", start_col="start", end_col="end")
+
+  # GRanges for gene TSS
+  gr_tss <- build_refseq_tss_gr(refseq_all)
+
+  # nearest gene (ignore strand)
+  hit <- distanceToNearest(gr_iv, gr_tss, ignore.strand = TRUE)
+  q  <- queryHits(hit)
+  s  <- subjectHits(hit)
+  dist <- mcols(hit)$distance
+
+  iv[, `:=`(nearest_gene = NA_character_, dist_to_tss = NA_integer_)]
+  iv[q, `:=`(
+    nearest_gene = mcols(gr_tss)$gene_symbol[s],
+    dist_to_tss  = as.integer(dist)
+  )]
+
+  iv
+}
+
+## ---- choose pELS/dELS intervals from your reduced cCRE intervals ----
+## Option A: if you have ccre_iv_list with reduced intervals:
+get_ccre_dt <- function(feature) {
+  if (exists("ccre_iv_list") && feature %in% names(ccre_iv_list)) {
+    dt <- as.data.table(copy(ccre_iv_list[[feature]]))
+    # enforce standard cols
+    stopifnot(all(c("chr","start","end") %in% names(dt)))
+    if (!("name" %in% names(dt))) dt[, name := paste0(feature, "_", seq_len(.N))]
+    dt[, feature := feature]
+    return(dt[])
+  }
+
+  # Option B: if you have one big reduced table ccre_red
+  if (exists("ccre_red")) {
+    dt <- as.data.table(copy(ccre_red))
+    # expect ccre_red has a feature/class column (adjust if yours uses something else)
+    feat_col <- intersect(names(dt), c("feature","class","group","type"))[1]
+    if (is.na(feat_col)) stop("ccre_red exists but cannot find feature/class column")
+    dt <- dt[get(feat_col) == feature]
+    if (!("name" %in% names(dt))) dt[, name := paste0(feature, "_", seq_len(.N))]
+    dt[, feature := feature]
+    return(dt[])
+  }
+
+  stop("Cannot find intervals for ", feature, ". Need ccre_iv_list[[feature]] or ccre_red.")
+}
+
+pels_dt <- get_ccre_dt("pELS")
+dels_dt <- get_ccre_dt("dELS")
+
+## ---- map to nearest genes ----
+pels_map <- map_intervals_to_nearest_gene(pels_dt, refseq_all)
+dels_map <- map_intervals_to_nearest_gene(dels_dt, refseq_all)
+
+ccre_gene_map <- rbindlist(list(pels_map, dels_map), use.names = TRUE, fill = TRUE)
+# ccre_gene_map has: chr,start,end,name,feature,nearest_gene,dist_to_tss
+
+```
+
+```{r}
+## ---- SCP259 gene expression stats (pick Healthy as “normal”) ----
+scp259_stats <- as.data.table(scp259_res$stats_per_gene)
+
+expr_tbl <- scp259_stats[, .(
+  gene = gene,
+  mean_expr = mean_SCP259_Healthy,
+  var_expr  = var_SCP259_Healthy
+)]
+
+## ---- keep only pELS/dELS PWD rows, attach nearest gene via interval 'name' ----
+pwd_ccre_2 <- as.data.table(copy(pwd_ccre))[
+  feature %chin% c("pELS","dELS")
+]
+
+pwd_ccre_2 <- merge(
+  pwd_ccre_2,
+  ccre_gene_map[, .(name, feature, nearest_gene, dist_to_tss)],
+  by = c("name","feature"),
+  all.x = TRUE
+)
+
+# drop intervals that failed mapping (should be rare unless chrom mismatch)
+pwd_ccre_2 <- pwd_ccre_2[!is.na(nearest_gene)]
+
+## ---- collapse interval-level PWD -> gene-level “conservation” (per pair, per feature) ----
+## weighted by CpG count so intervals with more CpGs contribute more
+gene_pwd <- pwd_ccre_2[
+  ,
+  .(
+    wmean_pwd = weighted.mean(pwd_mean, w = pmax(n_cpg, 1L), na.rm = TRUE),
+    n_intervals = .N,
+    total_cpg   = sum(n_cpg, na.rm = TRUE),
+    median_dist_to_tss = median(dist_to_tss, na.rm = TRUE)
+  ),
+  by = .(pair, feature, gene = nearest_gene)
+]
+
+## ---- join expression to gene-level PWD ----
+gene_pwd_expr <- merge(
+  gene_pwd,
+  expr_tbl,
+  by = "gene",
+  all.x = TRUE
+)
+
+# keep only genes that exist in SCP259 expression table
+gene_pwd_expr <- gene_pwd_expr[!is.na(mean_expr)]
+
+```
+
+
+```{r}
+# library(data.table)
+# library(ggplot2)
+# 
+# ## --- expression table (choose Healthy or UC) ---
+# expr_tbl <- copy(scp259_res$stats_per_gene)
+# expr_tbl <- expr_tbl[, .(
+#   gene,
+#   mean_expr = mean_SCP259_Healthy,
+#   var_expr  = var_SCP259_Healthy
+# )]
+# 
+# ## --- join expression onto gene-level PWD ---
+# gene_pwd_expr <- merge(gene_pwd, expr_tbl, by = "gene", all.x = TRUE)
+# gene_pwd_expr <- gene_pwd_expr[!is.na(mean_expr)]  # keep genes that exist in SCP259
+# 
+# ## optional: focus on Normal methylation pairs only (your WGBS)
+# gene_pwd_expr <- gene_pwd_expr[grepl("^Normal", pair)]
+# 
+# ## --- plot 1: mean expression vs methylation divergence ---
+# p_expr <- ggplot(
+#   gene_pwd_expr[feature %in% c("pELS","dELS")],
+#   aes(x = mean_expr, y = wmean_pwd)
+# ) +
+#   geom_point(alpha = 0.25, size = 0.8, color="steelblue") +
+#   facet_grid(feature ~ pair) +
+#   labs(
+#     x = "Mean expression in SCP259 Healthy (mean log2(CP10k+1) across epithelial cell types)",
+#     y = "Methylation divergence (gene-level mean PWD across mapped cCRE intervals)",
+#     title = "SCP259 expression vs methylation divergence for pELS/dELS-linked genes"
+#   ) +
+#   theme_bw(base_size = 12)
+# 
+# print(p_expr %+% gene_pwd_expr[feature == "pELS"])
+# print(p_expr %+% gene_pwd_expr[feature == "dELS"])
+# 
+# ## --- plot 2: expression variability vs methylation divergence ---
+# p_var <- ggplot(
+#   gene_pwd_expr[feature %in% c("pELS","dELS")],
+#   aes(x = var_expr, y = wmean_pwd)
+# ) +
+#   geom_point(alpha = 0.25, size = 0.8, color="steelblue") +
+#   facet_grid(feature ~ pair) +
+#   labs(
+#     x = "Expression variability in SCP259 Healthy (variance across epithelial cell types)",
+#     y = "Methylation divergence (gene-level mean PWD across mapped cCRE intervals)",
+#     title = "SCP259 cell-type variability vs methylation divergence for pELS/dELS-linked genes"
+#   ) +
+#   theme_bw(base_size = 12)
+# 
+# print(p_var %+% gene_pwd_expr[feature == "pELS"])
+# print(p_var %+% gene_pwd_expr[feature == "dELS"])
+
+```
+
+
+```{r}
+# gene_pwd_expr is your joined table that already has:
+# gene, feature (pELS/dELS), mean_expr, var_expr, wmean_pwd, pair, etc.
+
+gene_level_summary <- as.data.table(gene_pwd_expr)[
+  !is.na(gene) & nzchar(gene),
+  .(
+    # expression stats are gene-level already; keep one value per gene
+    mean_expr  = mean(mean_expr, na.rm = TRUE),
+    var_expr   = mean(var_expr,  na.rm = TRUE),
+
+    # methylation conservation across sample pairs / intervals
+    pwd_mean   = mean(wmean_pwd, na.rm = TRUE),
+    pwd_median = median(wmean_pwd, na.rm = TRUE),
+
+    n_pairs    = uniqueN(pair),
+    n_rows     = .N
+  ),
+  by = .(feature, gene)
+]
+
+topN_metric_per_feature <- function(dt, metric, col, N = 10L, decreasing = TRUE) {
+  stopifnot(is.data.table(dt))
+
+  # drop NA for the ranking column
+  x <- dt[!is.na(get(col))]
+
+  # rank within feature
+  x <- x[
+    order(feature, if (decreasing) -get(col) else get(col))
+  ][
+    , head(.SD, N),
+    by = feature
+  ]
+
+  # standard output columns
+  x[
+    , `:=`(metric = metric, value = get(col))
+  ][
+    , .(feature, gene, metric, value,
+        mean_expr, var_expr, pwd_mean, pwd_median,
+        n_pairs, n_rows)
+  ]
+}
+
+top10_mean_expr <- topN_metric_per_feature(
+  gene_level_summary,
+  metric = "top_mean_expr",
+  col    = "mean_expr",
+  N      = 10L,
+  decreasing = TRUE
+)
+
+top10_var_expr <- topN_metric_per_feature(
+  gene_level_summary,
+  metric = "top_var_expr",
+  col    = "var_expr",
+  N      = 10L,
+  decreasing = TRUE
+)
+
+top10_highest_pwd <- topN_metric_per_feature(
+  gene_level_summary,
+  metric = "highest_pwd",
+  col    = "pwd_mean",
+  N      = 10L,
+  decreasing = TRUE
+)
+
+top10_lowest_pwd <- topN_metric_per_feature(
+  gene_level_summary,
+  metric = "lowest_pwd",
+  col    = "pwd_mean",
+  N      = 10L,
+  decreasing = FALSE
+)
+
+# view
+top10_mean_expr[]
+top10_var_expr[]
+top10_highest_pwd[]
+top10_lowest_pwd[]
+
+
+```
+
+```{r}
+
+build_gene_TSS500_intervals <- function(refseq_all, genes_keep = NULL, flank = 500L) {
+  rs <- as.data.table(refseq_all)
+
+  # normalize chr column name
+  if (!("chr" %in% names(rs))) {
+    chr_col <- names(rs)[tolower(names(rs)) %in% c("chrom", "chr")][1]
+    if (is.na(chr_col)) stop("refseq_all: cannot find chrom/chr column")
+    setnames(rs, chr_col, "chr")
+  }
+
+  need <- c("chr","txStart","txEnd","strand","name2")
+  if (!all(need %in% names(rs))) {
+    stop("refseq_all missing: ", paste(setdiff(need, names(rs)), collapse=", "))
+  }
+
+  rs <- rs[
+    !is.na(name2) & name2 != "" &
+    !is.na(chr) & !is.na(txStart) & !is.na(txEnd) &
+    txEnd >= txStart
+  ]
+
+  if (!is.null(genes_keep)) {
+    rs <- rs[name2 %chin% genes_keep]
+  }
+
+  # UCSC: txStart is 0-based. TSS (1-based):
+  #  + strand: txStart + 1
+  #  - strand: txEnd
+  rs[, tss := fifelse(strand == "-", as.integer(txEnd), as.integer(txStart) + 1L)]
+
+  # 5'-most TSS per gene:
+  #   + strand: smallest tss
+  #   - strand: largest tss
+  gene_tss <- rs[
+    ,
+    .SD[
+      if (any(strand == "-")) which.max(tss) else which.min(tss)
+    ][1],
+    by = name2
+  ][, .(gene = name2, chr, strand, tss)]
+
+  # build TSS±500 window
+  gene_tss[, `:=`(
+    start = pmax(1L, tss - flank),
+    end   = tss + flank,
+    name  = gene
+  )]
+
+  gene_tss[, .(chr, start, end, name, gene)]
+}
+
+```
+
+```{r}
+scp259_res <- build_SCP259_tables("data/SCP259")
+scp259_stats <- as.data.table(scp259_res$stats_per_gene)
+
+tss500_iv <- build_gene_TSS500_intervals(
+  refseq_all,
+  genes_keep = scp259_stats$gene,
+  flank = 500L
+)
+
+setkey(tss500_iv, chr, start, end)
+
+tss500_pwd <- run_all_pairs_one_interval_dt(
+  bed_paths,
+  pairs,
+  intervals_dt   = tss500_iv,
+  min_cov        = min_cov,
+  min_cpgs       = min_cpgs,
+  interval_chunk = interval_chunk
+)
+
+# standardize columns to match your other gene-level tables
+tss500_pwd <- as.data.table(tss500_pwd)
+tss500_pwd[, `:=`(feature = "TSS500", gene = gene)]  # gene already there
+
+
+gene_pwd_tss500 <- tss500_pwd[
+  ,
+  .(
+    wmean_pwd   = weighted.mean(pwd_mean, w = pmax(n_cpg, 1L), na.rm = TRUE),
+    n_intervals = .N,
+    total_cpg   = sum(n_cpg, na.rm = TRUE)
+  ),
+  by = .(pair, feature, gene)
+]
+
+# Combine all gene-level PWD tables into one
+gene_pwd_all <- rbindlist(
+  list(
+    gene_pwd[, .(pair, feature, gene, wmean_pwd, n_intervals, total_cpg)],
+    gene_pwd_tss500[, .(pair, feature, gene, wmean_pwd, n_intervals, total_cpg)]
+  ),
+  use.names = TRUE,
+  fill = TRUE
+)
+
+
+# expr_tbl must exist: gene, mean_expr, var_expr (SCP259 Healthy)
+gene_pwd_expr_all <- merge(
+  gene_pwd_all,
+  expr_tbl,
+  by = "gene",
+  all.x = TRUE
+)
+
+# keep genes that exist in SCP259 expression
+gene_pwd_expr_all <- gene_pwd_expr_all[!is.na(mean_expr)]
+
+
+library(ggplot2)
+
+use_repel <- requireNamespace("ggrepel", quietly = TRUE)
+
+plot_scatter_feature <- function(dt, feature_name,
+                                 x_col = c("mean_expr", "var_expr"),
+                                 only_pairs_regex = "^Normal") {
+  x_col <- match.arg(x_col)
+
+  d <- as.data.table(dt)[
+    feature == feature_name & grepl(only_pairs_regex, pair)
+  ]
+
+  top5 <- unique(d[order(-mean_expr)][1:5, gene])
+
+  p <- ggplot(d, aes(x = .data[[x_col]], y = wmean_pwd)) +
+    geom_point(alpha = 0.25, size = 0.9) +
+    facet_wrap(~pair, nrow = 1, scales = "free_y") +
+    labs(
+      x = if (x_col == "mean_expr")
+        "Mean expression in SCP259 Healthy (mean log2(CP10k+1) across epithelial cell types)"
+      else
+        "Expression variability in SCP259 Healthy (variance across epithelial cell types)",
+      y = "Gene-level methylation divergence (weighted mean PWD)",
+      title = paste0("SCP259 Healthy: ", feature_name, " gene-level conservation vs expression")
+    ) +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank())
+
+  d_lab <- d[gene %in% top5]
+
+  if (use_repel) {
+    p <- p + ggrepel::geom_text_repel(
+      data = d_lab, aes(label = gene),
+      size = 3, max.overlaps = Inf, min.segment.length = 0
+    )
+  } else {
+    p <- p + geom_text(data = d_lab, aes(label = gene), size = 3, check_overlap = TRUE)
+  }
+
+  p
+}
+
+# mean-expression plots
+plot_scatter_feature(gene_pwd_expr_all, "pELS",   "mean_expr")
+plot_scatter_feature(gene_pwd_expr_all, "dELS",   "mean_expr")
+plot_scatter_feature(gene_pwd_expr_all, "TSS500", "mean_expr")
+
+
+# variability plots
+plot_scatter_feature(gene_pwd_expr_all, "pELS",   "var_expr")
+plot_scatter_feature(gene_pwd_expr_all, "dELS",   "var_expr")
+plot_scatter_feature(gene_pwd_expr_all, "TSS500", "var_expr")
+
+
+```
+
+### SCP1162 BPcells verison
+
+```{r}
+suppressPackageStartupMessages({
+  library(BPCells)
+})
+
+make_10x_staging_dir_gz_perm <- function(
+  mtx_path,
+  barc_path,
+  genes_path,
+  stage_dir_perm,
+  copy_matrix = FALSE
+) {
+  dir.create(stage_dir_perm, recursive = TRUE, showWarnings = FALSE)
+
+  mtx_out  <- file.path(stage_dir_perm, "matrix.mtx.gz")
+  barc_out <- file.path(stage_dir_perm, "barcodes.tsv.gz")
+  feat_out <- file.path(stage_dir_perm, "features.tsv.gz")
+
+  ## ---- matrix.mtx.gz: prefer symlink, fallback to copy ----
+  if (file.exists(mtx_out) || nzchar(Sys.readlink(mtx_out))) unlink(mtx_out)
+
+  ok <- FALSE
+  if (!copy_matrix) {
+    ok <- tryCatch(file.symlink(normalizePath(mtx_path), mtx_out), error = function(e) FALSE)
+    ok <- isTRUE(ok)
+  }
+  if (!ok) file.copy(mtx_path, mtx_out, overwrite = TRUE)
+
+  ## ---- barcodes.tsv.gz ----
+  barcs <- readLines(barc_path, warn = FALSE)
+  con_b <- gzfile(barc_out, "wt")
+  writeLines(barcs, con_b)
+  close(con_b)
+
+  ## ---- features.tsv.gz (3 columns required by 10x) ----
+  genes <- readLines(genes_path, warn = FALSE)
+  con_f <- gzfile(feat_out, "wt")
+  writeLines(paste(genes, genes, "Gene Expression", sep = "\t"), con_f)
+  close(con_f)
+
+  invisible(stage_dir_perm)
+}
+
+# ---- SCP1162 paths ----
+dir <- "data/SCP1162"
+mtx_path   <- file.path(dir, "matrix.mtx.gz")
+barc_path  <- file.path(dir, "matrix.barcodes.tsv")
+genes_path <- file.path(dir, "matrix.genes.tsv")
+
+# ---- permanent staging + output dirs ----
+stage_dir_perm <- file.path(dir, "bp_stage_10x")
+outdir_perm    <- file.path(dir, "bp_counts_dir")
+
+# 1) Create/refresh staging dir files (safe to rerun)
+make_10x_staging_dir_gz_perm(
+  mtx_path   = mtx_path,
+  barc_path  = barc_path,
+  genes_path = genes_path,
+  stage_dir_perm = stage_dir_perm,
+  copy_matrix = FALSE
+)
+
+stopifnot(all(file.exists(file.path(stage_dir_perm,
+                                    c("matrix.mtx.gz","barcodes.tsv.gz","features.tsv.gz")))))
+
+# 2) Import to BPCells MatrixDir ONCE
+#    IMPORTANT: outdir must NOT already exist
+if (dir.exists(outdir_perm)) unlink(outdir_perm, recursive = TRUE, force = TRUE)
+stopifnot(!dir.exists(outdir_perm))
+
+counts_bp <- BPCells::import_matrix_market_10x(
+  mtx_dir = stage_dir_perm,
+  outdir  = outdir_perm
+)
+
+counts_bp
+
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(BPCells)
+  library(data.table)
+})
+
+dir <- "data/SCP1162"
+
+# ---------- helper: robust column subsetting ----------
+select_cols_bp <- function(M, cols_idx) {
+  out <- tryCatch(M[, cols_idx, drop = FALSE], error = function(e) NULL)
+  if (!is.null(out)) return(out)
+  BPCells::select_cells(M, cols_idx)
+}
+
+# ---------- core: per-cell CP10k -> log -> mean by cluster ----------
+compute_expr_by_cluster_bp <- function(counts_bp, cluster_vec, cols_idx,
+                                       scale_factor = 1e4, log_base = 2) {
+  stopifnot(length(cluster_vec) == ncol(counts_bp))
+
+  # subset to selected cells
+  M  <- select_cols_bp(counts_bp, cols_idx)
+  cl <- cluster_vec[cols_idx]
+
+  keep <- !is.na(cl) & nzchar(cl)
+  if (!any(keep)) stop("No clustered cells in this subset.")
+
+  M  <- select_cols_bp(M, which(keep))
+  cl <- cl[keep]
+
+  # per-cell library size
+  lib <- BPCells::colSums(M)
+  lib[lib == 0] <- 1
+  sf <- scale_factor / lib
+
+  # CP10k per cell
+  M_cp10k <- BPCells::multiply_cols(M, sf)
+
+  # log1p(CP10k); convert to log2 if requested
+  M_log1p <- BPCells::log1p_slow(M_cp10k)
+
+  cl_levels <- sort(unique(cl))
+  means_list <- vector("list", length(cl_levels))
+  names(means_list) <- cl_levels
+
+  for (k in seq_along(cl_levels)) {
+    cols_k <- which(cl == cl_levels[k])
+    Mk <- select_cols_bp(M_log1p, cols_k)
+
+    v <- BPCells::rowMeans(Mk)         # ln space
+    if (log_base == 2) v <- v / log(2) # convert ln -> log2
+
+    means_list[[k]] <- v
+    rm(Mk); gc()
+  }
+
+  expr_mat <- do.call(cbind, means_list)  # genes x clusters (dense, but small)
+  colnames(expr_mat) <- cl_levels
+  expr_mat
+}
+
+# ---------- wrapper: build SCP1162 tables ----------
+build_SCP1162_tables_bp <- function(counts_bp, epi, meta) {
+  cells <- colnames(counts_bp)
+
+  # drop TYPE row if present
+  if ("TYPE" %in% epi$NAME)  epi  <- epi[NAME != "TYPE"]
+  if ("TYPE" %in% meta$NAME) meta <- meta[NAME != "TYPE"]
+
+  # align metadata to matrix columns
+  epi2  <- epi[match(cells, NAME),  .(ClusterFull, ClusterMidway)]
+  meta2 <- meta[match(cells, NAME), .(SpecimenType, MMRStatusTumor)]
+
+  cluster_full <- as.character(epi2$ClusterFull)
+  spec <- as.character(meta2$SpecimenType)
+  mmr  <- as.character(meta2$MMRStatusTumor)
+
+  # status labels
+  status <- rep(NA_character_, length(cells))
+  status[spec == "N"] <- "Normal"
+  status[spec == "A"] <- "Adenoma"
+  status[spec == "T" & mmr == "MMRd"] <- "Tumor_MMRd"
+  status[spec == "T" & mmr == "MMRp"] <- "Tumor_MMRp"
+
+  # epithelial only
+  epi_keep <- !is.na(cluster_full) & nzchar(cluster_full)
+  message("Total epithelial cells: ", sum(epi_keep))
+
+  out <- list()
+  for (tag in c("Normal", "Tumor_MMRd", "Tumor_MMRp")) {
+    idx <- which(epi_keep & status == tag)
+    message(tag, ": ", length(idx), " epithelial cells")
+    if (!length(idx)) { out[[tag]] <- NULL; next }
+
+    expr_mat <- compute_expr_by_cluster_bp(
+      counts_bp   = counts_bp,
+      cluster_vec = cluster_full,
+      cols_idx    = idx,
+      scale_factor = 1e4,
+      log_base     = 2
+    )
+
+    expr_dt <- as.data.table(expr_mat, keep.rownames = "gene")
+
+    mat <- as.matrix(expr_dt[, -1, with = FALSE])
+    stats_dt <- data.table(
+      gene      = expr_dt$gene,
+      mean_expr = rowMeans(mat, na.rm = TRUE),
+      var_expr  = apply(mat, 1L, var, na.rm = TRUE)
+    )
+
+    out[[tag]] <- list(
+      expr_by_celltype = expr_dt,
+      stats_per_gene   = stats_dt
+    )
+
+    rm(expr_mat, expr_dt, stats_dt); gc()
+  }
+
+  out
+}
+
+# ---------- RUN ----------
+# 1) open the permanent BPCells matrix-dir (no re-import)
+counts_bp <- BPCells::open_matrix_dir(file.path(dir, "bp_counts_dir"))
+
+# 2) load metadata
+epi  <- fread(file.path(dir, "crc10x_tSNE_cl_Epi.tsv"), sep = "\t")
+meta <- fread(file.path(dir, "metatable_v3_fix_v3.tsv"), sep = "\t")
+
+# 3) compute tables
+scp1162_res <- build_SCP1162_tables_bp(counts_bp, epi, meta)
+
+# check
+head(scp1162_res$Normal$expr_by_celltype)
+head(scp1162_res$Normal$stats_per_gene)
+
+```
+```{r}
+library(data.table)
+
+# pick which scRNA group you want on x-axis
+# options: "Normal", "Tumor_MMRd", "Tumor_MMRp"
+scp1162_stats_normal <- as.data.table(scp1162_res$Normal$stats_per_gene)
+scp1162_stats_mmrd   <- as.data.table(scp1162_res$Tumor_MMRd$stats_per_gene)
+scp1162_stats_mmrp   <- as.data.table(scp1162_res$Tumor_MMRp$stats_per_gene)
+
+setnames(scp1162_stats_normal, c("mean_expr","var_expr"), c("mean_expr_Normal","var_expr_Normal"))
+setnames(scp1162_stats_mmrd,   c("mean_expr","var_expr"), c("mean_expr_MMRd","var_expr_MMRd"))
+setnames(scp1162_stats_mmrp,   c("mean_expr","var_expr"), c("mean_expr_MMRp","var_expr_MMRp"))
+
+scp1162_stats <- Reduce(function(a,b) merge(a,b,by="gene",all=TRUE),
+                        list(scp1162_stats_normal, scp1162_stats_mmrd, scp1162_stats_mmrp))
+
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+})
+
+# helper: strip Ensembl version ENSG... ".5"
+strip_ens_version <- function(x) sub("\\.[0-9]+$", "", x)
+
+scp1162_stats[, gene_ens := strip_ens_version(gene)]
+
+# map ENSG -> SYMBOL
+map <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys     = unique(scp1162_stats$gene_ens),
+  keytype  = "ENSEMBL",
+  columns  = c("SYMBOL")
+)
+map <- as.data.table(map)[!is.na(SYMBOL)]
+setnames(map, c("ENSEMBL","SYMBOL"), c("gene_ens","gene_symbol"))
+
+# join + collapse duplicates (multiple ENSG -> same SYMBOL)
+scp1162_stats_sym <- merge(scp1162_stats, map, by="gene_ens", all.x=TRUE)
+
+# collapse to one row per SYMBOL (keep best-supported values)
+scp1162_stats_sym <- scp1162_stats_sym[!is.na(gene_symbol)][
+  , .(
+    mean_expr_Normal = mean(mean_expr_Normal, na.rm=TRUE),
+    var_expr_Normal  = mean(var_expr_Normal,  na.rm=TRUE),
+    mean_expr_MMRd   = mean(mean_expr_MMRd,   na.rm=TRUE),
+    var_expr_MMRd    = mean(var_expr_MMRd,    na.rm=TRUE),
+    mean_expr_MMRp   = mean(mean_expr_MMRp,   na.rm=TRUE),
+    var_expr_MMRp    = mean(var_expr_MMRp,    na.rm=TRUE)
+  ),
+  by = gene_symbol
+]
+
+pwd_gene <- as.data.table(gene_pwd_all)
+
+# join using SYMBOL
+scp1162_join <- merge(
+  pwd_gene,
+  scp1162_stats_sym,
+  by.x = "gene",
+  by.y = "gene_symbol",
+  all.x = FALSE,
+  all.y = FALSE
+)
+
+```
+
+```{r}
+library(ggplot2)
+
+use_repel <- requireNamespace("ggrepel", quietly=TRUE)
+
+plot_expr_vs_pwd <- function(dt, feature_name, expr_group = c("Normal","MMRd","MMRp"),
+                            x = c("mean","var"), only_pairs_regex="^Normal") {
+  expr_group <- match.arg(expr_group)
+  x <- match.arg(x)
+
+  xcol <- paste0(if (x=="mean") "mean_expr_" else "var_expr_", expr_group)
+
+  d <- as.data.table(dt)[
+    feature == feature_name & grepl(only_pairs_regex, pair) & !is.na(get(xcol))
+  ]
+
+  if (!nrow(d)) stop("No data after filtering; check feature/pair/ID mapping.")
+
+  # top 5 by expression (within feature)
+  top5 <- unique(d[order(-get(paste0("mean_expr_", expr_group)))][1:5, gene])
+
+  p <- ggplot(d, aes(x = .data[[xcol]], y = wmean_pwd)) +
+    geom_point(alpha=0.25, size=0.9) +
+    facet_wrap(~pair, nrow=1) +
+    theme_bw(base_size=12) +
+    labs(
+      x = sprintf("%s expression (%s)", ifelse(x=="mean","Mean","Variance"), expr_group),
+      y = "Gene-level methylation divergence (weighted mean PWD)",
+      title = sprintf("SCP1162 (%s): %s — %s vs PWD", expr_group, feature_name,
+                      ifelse(x=="mean","Mean expr","Expr variance"))
+    )
+
+  d_lab <- d[gene %in% top5]
+
+  if (use_repel) {
+    p <- p + ggrepel::geom_text_repel(
+      data=d_lab, aes(label=gene), size=3, max.overlaps=Inf, min.segment.length=0
+    )
+  } else {
+    p <- p + geom_text(data=d_lab, aes(label=gene), size=3, check_overlap=TRUE)
+  }
+
+  p
+}
+
+```
+
+```{r}
+# pELS
+plot_expr_vs_pwd(scp1162_join, "pELS", expr_group="Normal", x="mean")
+plot_expr_vs_pwd(scp1162_join, "pELS", expr_group="Normal", x="var")
+
+# dELS
+plot_expr_vs_pwd(scp1162_join, "dELS", expr_group="Normal", x="mean")
+plot_expr_vs_pwd(scp1162_join, "dELS", expr_group="Normal", x="var")
+
+# TSS500
+plot_expr_vs_pwd(scp1162_join, "TSS500", expr_group="Normal", x="mean")
+plot_expr_vs_pwd(scp1162_join, "TSS500", expr_group="Normal", x="var")
+
+# Compare to tumor expression (MMRd / MMRp)
+plot_expr_vs_pwd(scp1162_join, "pELS", expr_group="MMRd", x="mean")
+plot_expr_vs_pwd(scp1162_join, "pELS", expr_group="MMRp", x="mean")
+
+```
+
+
+## check if all TSS on the same strand
+## double check on the 5' most for paper 
+
+
+## pwd interval of what, right now are we caculating the PWD over the pELS interval or dELS
+
+## difference between means and variance between the normal and variances, three different normal (normal colon, normal from the mmrD and normal from mmrP)
+
+## 100 gene between scTransform vs log1p, will we pick out differnent gene, how many of them are overlap

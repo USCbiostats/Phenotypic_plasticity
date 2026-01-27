@@ -1,0 +1,321 @@
+---
+title: "Phenotypic_plasticity_data"
+output: html_document
+date: "2025-11-06"
+---
+
+
+```{r}
+## ------------------------------------------------------------
+## Setup
+## ------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(data.table)
+  library(tidyverse)
+  library(biomaRt)
+  library(glue)
+})
+
+## paths (edit if needed)
+f_ens <- "data/ucsc_hg38_gene_known_genecodeV48"         # screenshot 1 (no extension)
+f_ref <- "data/ucsc_hg38_gene_known_RefSeqALL.txt"       # screenshot 2
+
+## ------------------------------------------------------------
+## 1) Read UCSC tables and normalize ID versions in `name`
+##    - Ensembl transcripts look like ENST00000...".1"
+##    - RefSeq accessions look like NM_..., NR_..., XM_..., XR_...".2"
+## ------------------------------------------------------------
+ens_dt <- fread(f_ens, sep = "\t", header = TRUE, quote = "",
+                na.strings = c("", "NA")) |>
+  as_tibble()
+
+## rename "#name" -> "name" if present
+if ("#name" %in% names(ens_dt)) {
+  ens_dt <- ens_dt |> rename(name = `#name`)
+}
+
+## strip transcript version (e.g., ENST...".1")
+ens_dt <- ens_dt |>
+  mutate(name_raw = name,
+         name = sub("\\.\\d+$", "", name))
+
+ref_dt <- fread(f_ref, sep = "\t", header = TRUE, quote = "",
+                na.strings = c("", "NA")) |>
+  as_tibble()
+
+## rename "#bin" -> "bin" if present (optional), keep "name" as is
+if ("#bin" %in% names(ref_dt)) {
+  ref_dt <- ref_dt |> rename(bin = `#bin`)
+}
+
+## strip RefSeq version (e.g., NM_...".2")
+ref_dt <- ref_dt |>
+  mutate(name_raw = name,
+         name = sub("\\.\\d+$", "", name))
+
+cat(glue("Rows: Ensembl table = {nrow(ens_dt)}, RefSeq table = {nrow(ref_dt)}\n"))
+
+## Quick sanity check
+# safest: prefix dplyr verbs
+ens_dt %>%
+  dplyr::slice_head(n = 3) %>%
+  dplyr::select(name, chrom, strand) %>%
+  print()
+
+ref_dt %>%
+  dplyr::slice_head(n = 3) %>%
+  dplyr::select(name, chrom, strand) %>%
+  print()
+
+```
+
+
+```{r}
+## ------------------------------------------------------------
+## 2) Build an Ensembl→(HGNC, RefSeq) map with biomaRt
+##    We query ENSEMBL GRCh38 and request:
+##      - ensembl_transcript_id, ensembl_transcript_id_version
+##      - ensembl_gene_id
+##      - hgnc_symbol
+##      - refseq_mrna, refseq_ncrna, and predicted variants
+## ------------------------------------------------------------
+
+## robust connection helper (falls back to GRCh38 archive if needed)
+suppressPackageStartupMessages({
+  library(dplyr); library(purrr); library(tibble)
+  library(biomaRt); library(glue)
+})
+
+## robust connection (as before)
+.ens_connect <- function() {
+  tryCatch(
+    useEnsembl(biomart = "ensembl", dataset = "hsapiens_gene_ensembl"),
+    error = function(e) useEnsembl(biomart = "ensembl",
+                                   dataset = "hsapiens_gene_ensembl",
+                                   host = "https://grch38.ensembl.org")
+  )
+}
+mart <- .ens_connect()
+
+ens_ids <- unique(ens_dt$name)
+
+## helper: batched getBM
+bm_batched <- function(attrs, ids, mart, filter = "ensembl_transcript_id",
+                       chunk_size = 50000) {
+  split(ids, ceiling(seq_along(ids)/chunk_size)) |>
+    map(\(vec) {
+      getBM(attributes = attrs, filters = filter, values = vec, mart = mart) |>
+        as_tibble()
+    }) |>
+    list_rbind()
+}
+
+## 1) core attributes (no external refs)
+core_attrs <- c("ensembl_transcript_id",
+                "ensembl_transcript_id_version",
+                "ensembl_gene_id",
+                "hgnc_symbol")
+
+bm_core <- bm_batched(core_attrs, ens_ids, mart)
+
+## 2) pull each RefSeq attribute separately, then bind long
+ref_attrs <- c("refseq_mrna",            # NM_
+               "refseq_mrna_predicted",  # XM_
+               "refseq_ncrna",           # NR_
+               "refseq_ncrna_predicted") # XR_
+
+bm_ref_list <- map(ref_attrs, \(ra) {
+  bm_batched(c("ensembl_transcript_id", ra), ens_ids, mart) |>
+    rename(!!ra := all_of(ra))
+})
+```
+
+
+```{r}
+## merge core with concatenated ref columns
+bm <- bm_core
+for (tbl in bm_ref_list) {
+  bm <- dplyr::left_join(bm, dplyr::distinct(tbl, ensembl_transcript_id, .keep_all = TRUE),
+                         by = "ensembl_transcript_id")
+}
+bm <- bm %>% mutate(
+  ensembl_transcript_id  = sub("\\.\\d+$", "", ensembl_transcript_id),
+  refseq_mrna            = sub("\\.\\d+$", "", refseq_mrna),
+  refseq_mrna_predicted  = sub("\\.\\d+$", "", refseq_mrna_predicted),
+  refseq_ncrna           = sub("\\.\\d+$", "", refseq_ncrna),
+  refseq_ncrna_predicted = sub("\\.\\d+$", "", refseq_ncrna_predicted)
+)
+
+# bm_long
+bm_long <- bm %>%
+  dplyr::select(
+    ensembl_transcript_id, ensembl_gene_id, hgnc_symbol,
+    refseq_mrna, refseq_mrna_predicted, refseq_ncrna, refseq_ncrna_predicted
+  ) %>%
+  tidyr::pivot_longer(
+    cols = tidyselect::starts_with("refseq_"),
+    names_to = "refseq_type", values_to = "refseq_id"
+  ) %>%
+  dplyr::filter(!is.na(refseq_id), refseq_id != "") %>%
+  dplyr::distinct()
+
+## ------------------------------------------------------------
+## 3) Merge mapping back to your Ensembl table
+## ------------------------------------------------------------
+# ENST -> HGNC (unique)
+ens_map <- ens_dt %>%
+  dplyr::select(name) %>%
+  dplyr::distinct() %>%
+  dplyr::left_join(
+    bm %>% dplyr::select(ensembl_transcript_id, ensembl_gene_id, hgnc_symbol) %>%
+      dplyr::distinct(),
+    by = c("name" = "ensembl_transcript_id")
+  )
+
+## Attach RefSeqs (many-to-one); keep unique Ensembl–RefSeq pairs
+# ENST -> RefSeq (many-to-one)
+ens_to_refseq <- ens_dt %>%
+  dplyr::select(name) %>%
+  dplyr::distinct() %>%
+  dplyr::left_join(
+    bm_long %>% dplyr::select(ensembl_transcript_id, refseq_id) %>% dplyr::distinct(),
+    by = c("name" = "ensembl_transcript_id")
+  ) %>%
+  dplyr::filter(!is.na(refseq_id)) %>%
+  dplyr::distinct()
+```
+
+
+```{r}
+## ------------------------------------------------------------
+## 4) Compare against your UCSC RefSeq list
+## ------------------------------------------------------------
+# UCSC RefSeq list (version already stripped earlier)
+refseq_ucsc <- ref_dt %>% dplyr::transmute(refseq_id = name) %>% dplyr::distinct()
+
+# Overlap
+## Overlap on accession (version-stripped)
+ov_ids <- dplyr::inner_join(ens_to_refseq, refseq_ucsc, by = "refseq_id")
+
+n_ens          <- n_distinct(ens_dt$name)
+n_ens_mappedRS <- n_distinct(ens_to_refseq$name)       # ENST with ≥1 RefSeq
+n_refseq_ucsc  <- nrow(refseq_ucsc)
+n_refseq_from_ens <- n_distinct(ens_to_refseq$refseq_id)
+n_overlap_refseq  <- nrow(distinct(ov_ids, refseq_id))
+
+## Percentages of interest
+pct_ens_with_refseq   <- 100 * n_ens_mappedRS / n_ens
+pct_ucsc_refseq_seen  <- 100 * n_overlap_refseq / n_refseq_ucsc
+pct_refseq_from_ens_in_ucsc <- 100 * n_overlap_refseq / n_refseq_from_ens
+
+cat("\n===== Summary =====\n")
+cat(glue::glue("Unique ENST in UCSC Ensembl file: {n_ens}\n"))
+cat(glue::glue("ENST with ≥1 mapped RefSeq:       {n_ens_mappedRS} ({round(pct_ens_with_refseq,1)}%)\n\n"))
+
+cat(glue::glue("Unique RefSeq in UCSC RefSeq file: {n_refseq_ucsc}\n"))
+cat(glue::glue("Unique RefSeq from ENST mapping:   {n_refseq_from_ens}\n"))
+cat(glue::glue("Overlap (RefSeq IDs):              {n_overlap_refseq}\n"))
+cat(glue::glue("• % of UCSC RefSeq captured by ENST→RefSeq mapping: {round(pct_ucsc_refseq_seen,1)}%\n"))
+cat(glue::glue("• % of mapped RefSeq that appear in UCSC RefSeqALL: {round(pct_refseq_from_ens_in_ucsc,1)}%\n\n"))
+```
+
+
+```{r}
+## Optional: how many ENST still lack HGNC symbol or RefSeq?
+missing_hgnc <- ens_map %>% summarize(n_missing = sum(is.na(hgnc_symbol)))
+missing_refseq <- ens_dt %>%
+  dplyr::select(name) %>%
+  distinct() %>%
+  anti_join(ens_to_refseq %>% distinct(name), by = "name") %>%
+  nrow()
+
+cat(glue::glue("ENST without HGNC symbol: {missing_hgnc$n_missing}\n"))
+cat(glue::glue("ENST without any RefSeq:  {missing_refseq}\n"))
+
+## ------------------------------------------------------------
+## 5) Useful diagnostics to export
+## ------------------------------------------------------------
+## A) table of 1:many ENST→RefSeq (helps explain row-count differences)
+one_to_many <- ens_to_refseq %>%
+  count(name, name = "n_refseq") %>%
+  count(n_refseq, name = "n_enst") %>%
+  arrange(n_refseq)
+
+print(one_to_many)
+
+# ## B) write out mappings for audit
+# write_tsv(ens_map,       "ENST_to_HGNC_map.tsv")
+# write_tsv(ens_to_refseq, "ENST_to_RefSeq_map.tsv")
+# write_tsv(ov_ids,        "Overlap_ENSTmapped_vs_UCSCRefSeq.tsv")
+
+```
+```{r}
+suppressPackageStartupMessages({
+  library(rtracklayer)
+  library(dplyr)
+  library(stringr)
+})
+
+normalize_refseq <- function(x) {
+  x <- x[!is.na(x)]
+  x <- toupper(trimws(x))
+  sub("\\.\\d+$", "", x)   # drop version suffix
+}
+
+## (a) NCBI GTF IDs (transcripts only)
+gtf_path <- "data/hg38.ncbiRefSeq.gtf.gz"  # or the unzipped .gtf
+gr_all   <- rtracklayer::import(gtf_path)
+ids_ncbi <- mcols(gr_all)$transcript_id
+ids_ncbi <- ids_ncbi[!is.na(ids_ncbi)]
+ids_ncbi <- ids_ncbi[stringr::str_detect(ids_ncbi, stringr::regex("^(NM|NR|XM|XR)_", ignore_case = TRUE))]
+ids_ncbi <- normalize_refseq(ids_ncbi)
+ids_ncbi <- unique(ids_ncbi)
+
+## (b) Our mapped RefSeq set (ensure normalized)
+ids_map <- ens_to_refseq %>%
+  distinct(refseq_id) %>%
+  pull() %>%
+  normalize_refseq() %>%
+  unique()
+
+## (c) UCSC RefSeqALL IDs (normalize again just in case)
+ids_ucsc <- ref_dt %>%
+  distinct(name) %>%
+  pull() %>%
+  normalize_refseq() %>%
+  unique()
+
+## Overlaps
+ov_map_ncbi  <- length(intersect(ids_map,  ids_ncbi))
+ov_ncbi_ucsc <- length(intersect(ids_ncbi, ids_ucsc))
+
+cat(sprintf("
+--- ID overlap (version-stripped) ---
+Mapped RefSeq (ENST→RefSeq): %d
+NCBI GTF RefSeq IDs:         %d
+UCSC RefSeqALL IDs:          %d
+
+Overlap (Mapped ∩ NCBI):     %d  (%.1f%% of Mapped; %.1f%% of NCBI)
+Overlap (NCBI ∩ UCSC):       %d  (%.1f%% of NCBI; %.1f%% of UCSC)
+",
+  length(ids_map), length(ids_ncbi), length(ids_ucsc),
+  ov_map_ncbi,  100*ov_map_ncbi/length(ids_map),  100*ov_map_ncbi/length(ids_ncbi),
+  ov_ncbi_ucsc, 100*ov_ncbi_ucsc/length(ids_ncbi), 100*ov_ncbi_ucsc/length(ids_ucsc)
+))
+
+```
+
+```{r}
+# Why your mapped set is much smaller
+# 
+# This is expected:
+# 
+# Cross-reference incompleteness at the transcript level. Ensembl↔RefSeq links don’t exist for many transcripts (especially XM/XR predicted models). Ensembl/Gencode v48 won’t carry a RefSeq cross-ref for a large fraction of RefSeq transcripts.
+# 
+# Input restriction. You only map RefSeq reachable from the ENSTs in your first file. Anything not in that ENST universe is unreachable.
+# 
+# Release mismatches. GENCODE v48 vs the Ensembl snapshot you queried vs the UCSC/NCBI files. Some transcripts were added/withdrawn/renamed.
+# 
+# Transcript vs gene mapping. We used transcript-level attributes (refseq_*). Many RefSeq transcripts are linked only at the gene level in Ensembl.
+```
+

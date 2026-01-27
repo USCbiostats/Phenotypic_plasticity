@@ -1,0 +1,1369 @@
+---
+title: "Refseq_PWD"
+output: html_document
+date: "2025-11-07"
+---
+
+```{r}
+## ============================================================
+## Libraries
+## ============================================================
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(stringr)
+  library(ggplot2)
+  library(GenomicRanges)
+  library(GenomeInfoDb)
+  library(BiocParallel)
+  library(readr)
+  library(utils)   # for URLdecode
+})
+
+data.table::setDTthreads(4)   # try 3–6 on your Mac; start low if RAM is tight
+
+STD_CHR <- c(paste0("chr",1:22),"chrX","chrY")
+```
+
+
+```{r}
+## ============================================================
+## 0) Config / helpers
+## ============================================================
+
+# Standard chromosomes (UCSC style)
+STD_CHR <- c(paste0("chr", 1:22), "chrX", "chrY")
+
+# BiocParallel: safe default for macOS (forked), cap to avoid RAM blow-ups
+get_bpparam <- function(n_cores = max(1, parallel::detectCores() - 1L)) {
+  n_cores <- max(1L, min(n_cores, 6L))
+  MulticoreParam(workers = n_cores, progressbar = TRUE)
+}
+
+# PWD definition at CpG level
+pwd_vec <- function(beta1, beta2) abs(beta1 - beta2)
+
+# simple chrom filter for data.frames/tibbles with 'chr' or 'chrom' col
+filter_std_chrom <- function(df, col = NULL) {
+  if (is.null(col)) {
+    col <- intersect(c("chr","chrom","seqnames"), names(df))[1]
+  }
+  if (length(col) == 0) stop("No chromosome column found.")
+  dplyr::filter(df, .data[[col]] %in% STD_CHR)
+}
+
+# Read refseq_all from env or disk (RDS > TSV)
+get_refseq_all <- function(rds = "data/refseq_all.rds", tsv = "data/refseq_all.tsv") {
+  if (exists("refseq_all", inherits = FALSE) && is.data.frame(refseq_all)) return(refseq_all)
+  if (file.exists(rds)) return(readRDS(rds))
+  if (file.exists(tsv)) {
+    x <- readr::read_tsv(tsv, show_col_types = FALSE)
+    return(mutate(x,
+                  txStart  = as.integer(txStart),
+                  txEnd    = as.integer(txEnd),
+                  cdsStart = as.integer(cdsStart),
+                  cdsEnd   = as.integer(cdsEnd),
+                  exonCount= as.integer(exonCount)))
+  }
+  stop("refseq_all not found: supply refseq_all.rds or refseq_all.tsv")
+}
+
+
+## ============================================================
+## 1) Build *reduced* interval sets from refseq_all
+##    type: "tx", "cds", "tss500", "tss1000"
+##    Global reduction: each base counted at most once per type
+## ============================================================
+make_intervals_dt <- function(refseq_all,
+                              type = c("tx","cds","tss500","tss1000"),
+                              verbose = TRUE) {
+  type <- match.arg(type)
+  rs <- as.data.table(refseq_all)[chrom %in% c(paste0("chr",1:22),"chrX","chrY")]
+
+  ## 1) Build per-transcript intervals (1-based, closed)
+  if (type == "tx") {
+    out <- rs[!is.na(txStart) & !is.na(txEnd) & txEnd > txStart,
+              .(chr   = chrom,
+                start = txStart + 1L,   # 0-based half-open -> 1-based closed
+                end   = txEnd,
+                name,
+                gene  = name2)]
+
+  } else if (type == "cds") {
+    out <- rs[!is.na(cdsStart) & !is.na(cdsEnd) & cdsEnd > cdsStart,
+              .(chr   = chrom,
+                start = cdsStart + 1L,
+                end   = cdsEnd,
+                name,
+                gene  = name2)]
+
+  } else {
+    # TSS-centered windows
+    w <- if (type == "tss500") 1001L else 2001L
+    tt <- rs[!is.na(txStart) & !is.na(txEnd),
+             .(chrom, strand, name, name2,
+               tss0 = fifelse(strand == "+", txStart, txEnd))]
+    out <- tt[, .(chr   = chrom,
+                  start = pmax(1L, as.integer(tss0 - (w-1L)/2L) + 1L),
+                  end   = as.integer(tss0 + (w-1L)/2L),
+                  name  = name,
+                  gene  = name2)]
+  }
+
+  setDT(out)
+  # sanity: drop any inverted/NA
+  out[end < start, `:=`(start = NA_integer_, end = NA_integer_)]
+  out <- out[!is.na(start) & !is.na(end)]
+
+  n_before <- nrow(out)
+
+  if (!n_before) {
+    if (verbose) message(sprintf("[make_intervals_dt:%s] 0 intervals (nothing to reduce)", type))
+    # still return a data.table with expected columns
+    out_empty <- data.table(chr = character(), start = integer(), end = integer(),
+                            name = character(), gene = character())
+    setkey(out_empty, chr, start, end)
+    return(out_empty[])
+  }
+
+  ## 2) Global reduction: union of all intervals (no overlaps)
+  gr <- GRanges(
+    seqnames = out$chr,
+    ranges   = IRanges(start = as.integer(out$start),
+                       end   = as.integer(out$end))
+  )
+  gr_red <- reduce(gr)  # <- global union
+
+  red_dt <- as.data.table(gr_red)[
+    , .(chr   = as.character(seqnames),
+        start = as.integer(start),
+        end   = as.integer(end))
+  ]
+
+  n_after <- nrow(red_dt)
+
+  ## 3) Add synthetic IDs; gene is NA (a reduced block may span multiple genes)
+  red_dt[, name := sprintf("%s_%07d", type, .I)]
+  red_dt[, gene := NA_character_]
+
+  # order columns and key for foverlaps()
+  setcolorder(red_dt, c("chr","start","end","name","gene"))
+  setkey(red_dt, chr, start, end)
+
+  if (verbose) {
+    cat(sprintf("[make_intervals_dt:%s] intervals before reduce: %d; after reduce: %d\n",
+                type, n_before, n_after))
+  }
+
+  red_dt[]
+}
+
+
+## ============================================================
+## 2) Read CpG BEDs → GRanges
+##    Expect columns: chr start end beta cov meth unmeth
+## ============================================================
+read_cpg_bed_dt <- function(path, min_cov = 8L) {
+  dt <- fread(path, sep = "\t", header = FALSE,
+              col.names = c("chr","start","end","beta","cov","meth","unmeth"),
+              showProgress = FALSE)
+  dt <- dt[chr %chin% c(paste0("chr",1:22),"chrX","chrY")]
+  dt <- dt[!is.na(beta) & !is.na(cov) & cov >= min_cov,
+           .(chr, start = as.integer(start), beta = as.numeric(beta))]
+  # 1-based position for non-equi overlap
+  dt[, pos := start + 1L]
+  dt
+}
+
+
+## ============================================================
+## 3) PWD per interval for a pair of samples
+## ====================================================
+
+data.table::setDTthreads(4)
+
+# (3) corrected chunked PWD
+pwd_for_pair_chunked <- function(pathA, pathB, intervals_dt,
+                                 min_cov = 8L, min_cpgs = 1L,
+                                 interval_chunk = 50000L) {
+
+  A <- read_cpg_bed_dt(pathA, min_cov)  # chr, start, beta, pos
+  B <- read_cpg_bed_dt(pathB, min_cov)
+
+  # 1) CpG-level inner join on loci (chr, start)
+  data.table::setkeyv(A, c("chr","start"))
+  data.table::setkeyv(B, c("chr","start"))
+  AB <- B[A, nomatch = 0L]              # beta from A, i.beta from B
+  if (!nrow(AB)) {
+    return(data.table::data.table(name = character(),
+                                  gene = character(),
+                                  pwd_mean = numeric(),
+                                  n_cpg = integer()))
+  }
+
+  # 2) Represent each CpG as a 1-bp "interval" at pos
+  AB_pts <- AB[, .(chr,
+                   start = as.integer(pos),
+                   end   = as.integer(pos),  # or pos+1L if you want half-open
+                   betaA = beta,
+                   betaB = i.beta)]
+  data.table::setkey(AB_pts, chr, start, end)
+
+  # 3) Work per chromosome to keep memory small
+  chrs <- intersect(unique(AB_pts$chr), unique(intervals_dt$chr))
+  out_chr <- vector("list", length(chrs))
+
+  for (ci in seq_along(chrs)) {
+    ch <- chrs[ci]
+    cpg_ch <- AB_pts[chr == ch]
+    iv_ch  <- intervals_dt[chr == ch]
+    if (!nrow(cpg_ch) || !nrow(iv_ch)) next
+
+    # chunk the interval table
+    idx <- split(seq_len(nrow(iv_ch)),
+                 ceiling(seq_len(nrow(iv_ch)) / interval_chunk))
+
+    out_chunks <- vector("list", length(idx))
+    for (k in seq_along(idx)) {
+      iv_chunk <- iv_ch[idx[[k]], .(chr, start, end, name, gene)]
+      iv_chunk[, `:=`(start = as.integer(start), end = as.integer(end))]
+      data.table::setkey(iv_chunk, chr, start, end)
+
+      # non-equi join: CpG points within intervals
+      j <- data.table::foverlaps(cpg_ch, iv_chunk, nomatch = 0L)
+      if (!nrow(j)) next
+
+      # interval-level PWD: | mean(betaA) - mean(betaB) |
+      out_chunks[[k]] <- j[, {
+        mA <- mean(betaA, na.rm = TRUE)
+        mB <- mean(betaB, na.rm = TRUE)
+        .(pwd_mean = abs(mA - mB),
+          n_cpg    = .N)
+      }, by = .(name, gene)]
+    }
+
+    out_chr[[ci]] <- data.table::rbindlist(out_chunks, use.names = TRUE, fill = TRUE)
+    gc()
+  }
+
+  res <- data.table::rbindlist(out_chr, use.names = TRUE, fill = TRUE)
+  if (!nrow(res)) return(res)
+
+  # enforce minimum CpGs per interval and drop duplicates
+  unique(res[n_cpg >= min_cpgs])
+}
+
+
+## ============================================================
+## 4) Wrapper: run all pairs for one interval set
+## ============================================================
+run_all_pairs_one_interval_dt <- function(bed_paths, pairs, intervals_dt,
+                                          min_cov = 8L, min_cpgs = 1L,
+                                          interval_chunk = 50000L) {
+  out <- vector("list", length(pairs))
+  nm <- names(pairs)
+  for (i in seq_along(pairs)) {
+    s1 <- pairs[[i]][1]; s2 <- pairs[[i]][2]
+    message(sprintf("Pair %d/%d: %s vs %s", i, length(pairs), s1, s2))
+    tbl <- pwd_for_pair_chunked(bed_paths[[s1]], bed_paths[[s2]], intervals_dt,
+                                min_cov = min_cov, min_cpgs = min_cpgs,
+                                interval_chunk = interval_chunk)
+    if (nrow(tbl)) {
+      tbl[, `:=`(pair = nm[i], sampleA = s1, sampleB = s2)]
+      out[[i]] <- tbl
+    }
+    # free memory aggressively
+    gc()
+  }
+  rbindlist(out, use.names = TRUE, fill = TRUE)
+}
+
+
+## ============================================================
+## 5) Plot helper
+## ============================================================
+plot_pwd <- function(df, title) {
+  ggplot(df, aes(x = pair, y = pwd_mean)) +
+    geom_violin(trim = TRUE, scale = "width") +
+    geom_boxplot(width = 0.12, outlier.size = 0.3) +
+    # add mean as red dot
+    stat_summary(
+      fun = "mean",
+      geom = "point",
+      colour = "red",
+      size = 1.5
+    ) +
+    labs(title = title, x = NULL, y = "PWD (mean |Δβ| per interval)") +
+    coord_cartesian(ylim = c(0, 0.5)) +
+    theme_bw(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+## ============================================================
+## 6) Example driver
+## ============================================================
+# 6a) bring in refseq_all
+refseq_all <- get_refseq_all() %>% filter_std_chrom(col = "chrom")
+
+# 6b) define your BED paths (edit to your actual locations)
+# names must be unique sample IDs matching your pairs
+bed_paths <- c(
+  EN = "data/EN.bed",
+  IN = "data/IN.bed",
+  JN = "data/JN.bed",
+  PA = "data/PA.bed", PB = "data/PB.bed",
+  SA = "data/SA.bed", SB = "data/SB.bed",
+  XA = "data/XA.bed", XB = "data/XB.bed",
+  DA = "data/DA.bed", DB = "data/DB.bed",
+  EA = "data/EA.bed", EB = "data/EB.bed",
+  FA = "data/FA.bed", FB = "data/FB.bed",
+  HA = "data/HA.bed", HB = "data/HB.bed",
+  IA = "data/IA.bed", IB = "data/IB.bed",
+  JA = "data/JA.bed", JB = "data/JB.bed",
+  KA = "data/KA.bed", KB = "data/KB.bed",
+  MA = "data/MA.bed", MB = "data/MB.bed"
+)
+
+# 6c) define the 14 pairs (names become group labels on the plots)
+pairs <- list(
+  "Normal EN–IN" = c("EN","IN"),
+  "Normal EN–JN" = c("EN","JN"),
+  "Normal IN–JN" = c("IN","JN"),
+  "Adenoma PA–PB"= c("PA","PB"),
+  "Adenoma SA–SB"= c("SA","SB"),
+  "Adenoma XA–XB"= c("XA","XB"),
+  "CRC DA–DB"    = c("DA","DB"),
+  "CRC EA–EB"    = c("EA","EB"),
+  "CRC FA–FB"    = c("FA","FB"),
+  "CRC HA–HB"    = c("HA","HB"),
+  "CRC IA–IB"    = c("IA","IB"),
+  "CRC JA–JB"    = c("JA","JB"),
+  "CRC KA–KB"    = c("KA","KB"),
+  "CRC MA–MB"    = c("MA","MB")
+)
+
+# 6d) choose parameters
+# build intervals once (globally reduced)
+iv_tx_dt      <- make_intervals_dt(refseq_all, "tx")
+iv_cds_dt     <- make_intervals_dt(refseq_all, "cds")
+iv_tss500_dt  <- make_intervals_dt(refseq_all, "tss500")
+iv_tss1000_dt <- make_intervals_dt(refseq_all, "tss1000")
+
+# you can keep these lines; they’re redundant but harmless
+iv_tx_dt[,      `:=`(start = as.integer(start), end = as.integer(end))]
+iv_cds_dt[,     `:=`(start = as.integer(start), end = as.integer(end))]
+iv_tss500_dt[,  `:=`(start = as.integer(start), end = as.integer(end))]
+iv_tss1000_dt[, `:=`(start = as.integer(start), end = as.integer(end))]
+data.table::setkey(iv_tx_dt,      chr, start, end)
+data.table::setkey(iv_cds_dt,     chr, start, end)
+data.table::setkey(iv_tss500_dt,  chr, start, end)
+data.table::setkey(iv_tss1000_dt, chr, start, end)
+```
+
+
+```{r}
+# parameters
+min_cov      <- 8L
+min_cpgs     <- 1L
+interval_chunk <- 50000L  # shrink if still memory tight (e.g., 20k)
+
+# compute
+pwd_tx      <- run_all_pairs_one_interval_dt(bed_paths, pairs, iv_tx_dt,
+                                             min_cov, min_cpgs, interval_chunk)
+pwd_cds     <- run_all_pairs_one_interval_dt(bed_paths, pairs, iv_cds_dt,
+                                             min_cov, min_cpgs, interval_chunk)
+pwd_tss500  <- run_all_pairs_one_interval_dt(bed_paths, pairs, iv_tss500_dt,
+                                             min_cov, min_cpgs, interval_chunk)
+pwd_tss1000 <- run_all_pairs_one_interval_dt(bed_paths, pairs, iv_tss1000_dt,
+                                             min_cov, min_cpgs, interval_chunk)
+
+# plotting (unchanged; convert data.table → data.frame if needed)
+plot_pwd(as.data.frame(pwd_tx),      "PWD — tx")
+plot_pwd(as.data.frame(pwd_cds),     "PWD — CDS")
+plot_pwd(as.data.frame(pwd_tss500),  "PWD — TSS ±500")
+plot_pwd(as.data.frame(pwd_tss1000), "PWD — TSS ±1000")
+
+
+
+# ggsave("pwd_tx.pdf", p_tx, width=10, height=5)
+
+```
+```{r}
+suppressPackageStartupMessages({ library(dplyr); library(readr); library(tidyr) })
+
+# bind the four result tables you already computed
+pwd_all <- bind_rows(
+  mutate(pwd_tx,      interval = "tx"),
+  mutate(pwd_cds,     interval = "cds"),
+  mutate(pwd_tss500,  interval = "tss500"),
+  mutate(pwd_tss1000, interval = "tss1000")
+)
+
+# summary per pair × interval
+pwd_summary <- pwd_all %>%
+  group_by(interval, pair) %>%
+  summarise(
+    n_intervals = n(),
+    # unweighted
+    mean_pwd    = mean(pwd_mean, na.rm = TRUE),
+    median_pwd  = median(pwd_mean, na.rm = TRUE),
+    q1          = quantile(pwd_mean, 0.25, na.rm = TRUE),
+    q3          = quantile(pwd_mean, 0.75, na.rm = TRUE),
+    max_pwd     = max(pwd_mean, na.rm = TRUE),
+    # weighted by number of CpGs contributing to each interval
+    wmean_pwd   = weighted.mean(pwd_mean, w = pmax(n_cpg, 1L), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(interval, pair)
+
+# optional: normals vs adenoma vs CRC label for quick grouping
+pwd_summary <- pwd_summary %>%
+  mutate(group =
+           case_when(
+             grepl("^Normal", pair)  ~ "Normal",
+             grepl("^Adenoma", pair) ~ "Adenoma",
+             grepl("^CRC", pair)     ~ "CRC",
+             TRUE ~ "Other"
+           ))
+
+# save
+# write_csv(pwd_summary, "PWD_summary_by_pair_interval.csv")
+
+# peek
+print(pwd_summary, n = 50)
+
+
+# dplyr
+pwd_summary %>% dplyr::filter(group == "Normal")
+
+```
+
+
+```{r}
+library(data.table)
+library(dplyr)
+
+## Helper: build *raw* (non-reduced) intervals, same definition as before
+make_intervals_raw <- function(refseq_all, type = c("tx","cds","tss500","tss1000")) {
+  type <- match.arg(type)
+  rs <- as.data.table(refseq_all)[chrom %in% c(paste0("chr",1:22),"chrX","chrY")]
+
+  if (type == "tx") {
+    out <- rs[!is.na(txStart) & !is.na(txEnd) & txEnd > txStart,
+              .(chr   = chrom,
+                start = txStart + 1L,
+                end   = txEnd)]
+
+  } else if (type == "cds") {
+    out <- rs[!is.na(cdsStart) & !is.na(cdsEnd) & cdsEnd > cdsStart,
+              .(chr   = chrom,
+                start = cdsStart + 1L,
+                end   = cdsEnd)]
+
+  } else {
+    w <- if (type == "tss500") 1001L else 2001L
+    tt <- rs[!is.na(txStart) & !is.na(txEnd),
+             .(chrom, strand,
+               tss0 = fifelse(strand == "+", txStart, txEnd))]
+    out <- tt[, .(chr   = chrom,
+                  start = pmax(1L, as.integer(tss0 - (w-1L)/2L) + 1L),
+                  end   = as.integer(tss0 + (w-1L)/2L))]
+  }
+
+  setDT(out)
+  out[end < start, `:=`(start = NA_integer_, end = NA_integer_)]
+  out[!is.na(start) & !is.na(end)]
+}
+
+## Helper: summarise a DT of intervals
+summarise_intervals <- function(dt) {
+  if (is.null(dt) || !nrow(dt))
+    return(data.table(n = 0, min_len = NA_real_, max_len = NA_real_, mean_len = NA_real_))
+  dt[, len := as.numeric(end - start + 1L)]
+  dt[, .(
+    n        = .N,
+    min_len  = min(len),
+    max_len  = max(len),
+    mean_len = mean(len)
+  )]
+}
+
+## Build raw (non-reduced) sets
+raw_tx      <- make_intervals_raw(refseq_all, "tx")
+raw_cds     <- make_intervals_raw(refseq_all, "cds")
+raw_tss500  <- make_intervals_raw(refseq_all, "tss500")
+raw_tss1000 <- make_intervals_raw(refseq_all, "tss1000")
+
+## Summaries before / after reduce
+sum_before <- rbindlist(list(
+  cbind(type = "tx",      stage = "before", summarise_intervals(raw_tx)),
+  cbind(type = "cds",     stage = "before", summarise_intervals(raw_cds)),
+  cbind(type = "tss500",  stage = "before", summarise_intervals(raw_tss500)),
+  cbind(type = "tss1000", stage = "before", summarise_intervals(raw_tss1000))
+), use.names = TRUE)
+
+sum_after <- rbindlist(list(
+  cbind(type = "tx",      stage = "after", summarise_intervals(iv_tx_dt)),
+  cbind(type = "cds",     stage = "after", summarise_intervals(iv_cds_dt)),
+  cbind(type = "tss500",  stage = "after", summarise_intervals(iv_tss500_dt)),
+  cbind(type = "tss1000", stage = "after", summarise_intervals(iv_tss1000_dt))
+), use.names = TRUE)
+
+interval_summary <- rbindlist(list(sum_before, sum_after), use.names = TRUE) %>%
+  arrange(type, stage)
+
+interval_summary
+
+```
+```{r}
+
+library(dplyr)
+
+pairs <- refseq_all %>% distinct(txStart, name2)
+
+
+shared_tx <- pairs %>%
+  group_by(txStart) %>%
+  summarise(
+    n_genes = n_distinct(name2),
+    genes   = list(sort(unique(name2))),
+    .groups = "drop"
+  ) %>%
+  filter(n_genes > 1)
+
+shared_tx
+
+```
+```{r}
+shared_tx_pretty <- shared_tx %>%
+  mutate(genes = sapply(genes, paste, collapse = ", "))
+
+shared_tx_pretty
+
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+})
+
+STD_CHR <- c(paste0("chr", 1:22), "chrX", "chrY")
+
+## 1) Helper to build *raw* (unreduced) intervals from refseq_all
+make_intervals_raw <- function(refseq_all, type = c("tx","cds")) {
+  type <- match.arg(type)
+  rs <- as.data.table(refseq_all)[chrom %chin% STD_CHR]
+
+  if (type == "tx") {
+    out <- rs[!is.na(txStart) & !is.na(txEnd) & txEnd > txStart,
+              .(chr   = chrom,
+                start = txStart + 1L,
+                end   = txEnd)]
+
+  } else if (type == "cds") {
+    out <- rs[!is.na(cdsStart) & !is.na(cdsEnd) & cdsEnd > cdsStart,
+              .(chr   = chrom,
+                start = cdsStart + 1L,
+                end   = cdsEnd)]
+
+  }
+
+  out[end < start, `:=`(start = NA_integer_, end = NA_integer_)]
+  out[!is.na(start)]
+}
+
+## 2) Build raw + reduced length table
+types <- c("tx","cds")
+
+# raw (before reduce)
+raw_list <- lapply(types, function(tp) make_intervals_raw(refseq_all, tp))
+names(raw_list) <- types
+
+# reduced (after reduce) – using objects you already have
+red_list <- list(
+  tx      = iv_tx_dt,
+  cds     = iv_cds_dt
+  # tss500  = iv_tss500_dt,
+  # tss1000 = iv_tss1000_dt
+)
+
+# construct long length table
+len_long <- rbindlist(lapply(types, function(tp) {
+  raw <- copy(raw_list[[tp]])[, .(len = end - start + 1L)]
+  raw[, `:=`(type = tp, stage = "before")]
+
+  red <- copy(red_list[[tp]])[, .(len = end - start + 1L)]
+  red[, `:=`(type = tp, stage = "after")]
+
+  rbind(raw, red)
+}), use.names = TRUE)
+
+
+len_means <- len_long %>%
+  group_by(type, stage) %>%
+  summarise(mean_len = mean(len), .groups = "drop")
+
+## 2) Histogram with frequency + mean lines
+ggplot(len_long, aes(x = len, fill = stage)) +
+  geom_histogram(
+    aes(y = after_stat(..count.. / sum(..count..))),  # proportion
+    position = "identity",
+    alpha = 0.4,
+    bins = 80
+  ) +
+  # mean lines (before vs after)
+  geom_vline(
+    data = len_means,
+    aes(xintercept = mean_len, color = stage),
+    linetype = "dashed",
+    linewidth = 0.5,
+    show.legend = FALSE
+  ) +
+  xlim(1, 100000) +
+  facet_wrap(~ type, scales = "free_y") +
+  labs(
+    x = "Interval length (bp)",
+    y = "Frequency (proportion within group)",
+    fill = "Stage",
+    title = "Interval length distributions before vs after reduction"
+  ) +
+  theme_bw(base_size = 12)
+
+```
+
+
+## Adding colon information
+```{r}
+read_ccres_by_class <- function(path_bed,
+                                classes = c("PLS","pELS","dELS","CA-only","CA-CTCF","CA-H3K4me3","CA-TF","TF")) {
+  # Read with many columns; keep only chr/start/end + the column that carries class labels
+  dt <- fread(path_bed, header = FALSE, sep = "\t", quote = "", data.table = TRUE, showProgress = FALSE)
+  # Force generic names V1..Vn
+  setnames(dt, paste0("V", seq_len(ncol(dt))))
+  # Identify candidate character columns
+  char_cols <- names(dt)[vapply(dt, is.character, logical(1))]
+  if (length(char_cols) == 0L) stop("No character columns to detect cCRE class.")
+
+  # Find the column most likely to contain the class labels
+  score_col <- function(col) sum(dt[[col]] %chin% classes, na.rm = TRUE)
+  hits <- vapply(char_cols, score_col, integer(1))
+  class_col <- if (max(hits) > 0) names(hits)[which.max(hits)] else {
+    # Fallback heuristic: often second-to-last column stores class in SCREEN BEDs
+    names(dt)[max(1, ncol(dt)-1)]
+  }
+
+  # Keep skinny table
+  cc <- dt[, .(chr = as.character(V1),
+               start = as.integer(V2),
+               end   = as.integer(V3),
+               class = as.character(get(class_col)))]
+
+  cc <- cc[chr %chin% STD_CHR & !is.na(start) & !is.na(end) & end > start]
+  # Subset to desired classes
+  cc <- cc[class %chin% classes]
+
+  # Split to list by class and key for fast overlaps
+  cc_list <- split(cc, by = "class", drop = TRUE, keep.by = FALSE)
+  for (nm in names(cc_list)) {
+    setkey(cc_list[[nm]], chr, start, end)
+  }
+  cc_list
+}
+
+# use it
+ccre_path <- "data/large_intestine.noccl.cCREs.bed"
+ccre_list <- read_ccres_by_class(ccre_path)
+names(ccre_list)
+```
+
+
+```{r}
+reduce_ccre_list <- function(ccre_list) {
+  out_list <- vector("list", length(ccre_list))
+  sum_list <- vector("list", length(ccre_list))
+  names(out_list) <- names(sum_list) <- names(ccre_list)
+
+  for (nm in names(ccre_list)) {
+    dt0 <- ccre_list[[nm]][chr %chin% STD_CHR]
+
+    if (!nrow(dt0)) {
+      sum_list[[nm]] <- data.table(
+        class          = nm,
+        n_before       = 0L,
+        min_len_before = NA_real_,
+        mean_len_before= NA_real_,
+        max_len_before = NA_real_,
+        n_after        = 0L,
+        min_len_after  = NA_real_,
+        mean_len_after = NA_real_,
+        max_len_after  = NA_real_
+      )
+      out_list[[nm]] <- data.table(chr=character(), start=integer(),
+                                   end=integer(), name=character(), gene=character())
+      next
+    }
+
+    ## lengths BEFORE reduction (BED convention: length = end - start)
+    len_before <- dt0$end - dt0$start
+
+    ## convert to 1-based inclusive for GRanges & PWD
+    dt1 <- copy(dt0)[, start := start + 1L]
+
+    gr <- GRanges(
+      seqnames = dt1$chr,
+      ranges   = IRanges::IRanges(start = dt1$start, end = dt1$end)
+    )
+    gr_red <- GenomicRanges::reduce(gr, ignore.strand = TRUE)
+
+    rd <- as.data.table(gr_red)[,
+      .(chr   = as.character(seqnames),
+        start = as.integer(start),
+        end   = as.integer(end))
+    ]
+
+    ## add unique ID per reduced interval (needed for grouping PWD)
+    rd[, `:=`(
+      name = sprintf("%s_%06d", nm, .I),
+      gene = nm
+    )]
+    setkey(rd, chr, start, end)
+
+    len_after <- rd$end - rd$start + 1L  # lengths after reduction (inclusive)
+
+    sum_list[[nm]] <- data.table(
+      class           = nm,
+      n_before        = nrow(dt0),
+      min_len_before  = min(len_before),
+      mean_len_before = mean(len_before),
+      max_len_before  = max(len_before),
+      n_after         = nrow(rd),
+      min_len_after   = min(len_after),
+      mean_len_after  = mean(len_after),
+      max_len_after   = max(len_after)
+    )
+
+    out_list[[nm]] <- rd
+  }
+
+  summary_dt <- rbindlist(sum_list, use.names = TRUE)
+  list(intervals = out_list, summary = summary_dt)
+}
+
+ccre_red        <- reduce_ccre_list(ccre_list)
+ccre_iv_list    <- ccre_red$intervals      # reduced intervals per class
+ccre_len_summary <- ccre_red$summary      # before/after metrics
+ccre_len_summary[]
+
+```
+
+```{r}
+dt_raw <- data.table::fread("data/large_intestine.noccl.cCREs.bed",
+                            header = FALSE, sep = "\t", quote = "",
+                            data.table = TRUE, showProgress = FALSE)
+setnames(dt_raw, paste0("V", seq_len(ncol(dt_raw))))
+
+# what are the character columns?
+char_cols <- names(dt_raw)[vapply(dt_raw, is.character, logical(1))]
+char_cols
+
+# For each candidate column, look at top labels
+for (cn in char_cols) {
+  cat("\n=== ", cn, " ===\n")
+  print(dt_raw[, .N, by = get(cn)][order(-N)][1:10])
+}
+
+```
+```{r}
+# parameters already defined earlier:
+# bed_paths, pairs, min_cov, min_cpgs, interval_chunk
+
+pwd_ccre_list <- lapply(names(ccre_iv_list), function(nm) {
+  iv_dt <- ccre_iv_list[[nm]]
+  message("Computing PWD for cCRE class: ", nm)
+
+  tbl <- run_all_pairs_one_interval_dt(
+    bed_paths,
+    pairs,
+    intervals_dt   = iv_dt,
+    min_cov        = min_cov,
+    min_cpgs       = min_cpgs,
+    interval_chunk = interval_chunk
+  )
+
+  if (nrow(tbl)) {
+    tbl[, feature := nm]
+  }
+  tbl
+})
+
+pwd_ccre <- data.table::rbindlist(pwd_ccre_list, use.names = TRUE, fill = TRUE)
+pwd_ccre[]
+
+unique_features <- unique(pwd_ccre$feature)
+
+for (nm in unique_features) {
+  df_nm <- as.data.frame(pwd_ccre[feature == nm])
+  print(
+    plot_pwd(df_nm, paste0("PWD — cCRE class ", nm))
+  )
+}
+
+```
+
+
+
+
+## CPG islands info
+
+```{r}
+read_ucsc_cpg_islands <- function(path_tsv) {
+  # Typical columns: chrom, chromStart, chromEnd, ...
+  dt <- fread(path_tsv, sep = "\t", header = TRUE,
+              data.table = TRUE, showProgress = FALSE)
+
+  cn <- names(dt)
+  chr_col <- cn[grepl("^chr$|^chrom$", tolower(cn))][1]
+  st_col  <- cn[grepl("start", tolower(cn))][1]
+  en_col  <- cn[grepl("end",   tolower(cn))][1]
+
+  if (any(is.na(c(chr_col, st_col, en_col)))) {
+    stop("Could not detect chrom/start/end columns in CpG island file.")
+  }
+
+  # UCSC bed: chromStart = 0-based, chromEnd = 1-based exclusive
+  out <- dt[, .(
+    chr   = as.character(get(chr_col)),
+    start = as.integer(get(st_col) + 1L),  # -> 1-based inclusive
+    end   = as.integer(get(en_col))        # already 1-based
+  )]
+
+  out <- out[chr %chin% STD_CHR & !is.na(start) & !is.na(end) & end > start]
+  setkey(out, chr, start, end)
+  out
+}
+
+cpgis_path   <- "data/ucsc_cpgislandext.tsv"
+cpg_islands0 <- read_ucsc_cpg_islands(cpgis_path)  # 1-based inclusive
+
+# Interval lengths BEFORE reduction
+cgi_len_before <- cpg_islands0$end - cpg_islands0$start + 1L
+
+# Global reduction via GRanges (union of all islands)
+gr_cgi  <- GRanges(
+  seqnames = cpg_islands0$chr,
+  ranges   = IRanges(start = cpg_islands0$start,
+                     end   = cpg_islands0$end)
+)
+gr_cgi_red <- reduce(gr_cgi, ignore.strand = TRUE)
+
+cpg_islands <- as.data.table(gr_cgi_red)[
+  , .(chr   = as.character(seqnames),
+      start = as.integer(start),
+      end   = as.integer(end))
+]
+
+# Add interval IDs + "gene" label so it fits PWD pipeline
+cpg_islands[, `:=`(
+  name = sprintf("CGI_%06d", .I),
+  gene = "CpG_island"
+)]
+setkey(cpg_islands, chr, start, end)
+
+cgi_len_after <- cpg_islands$end - cpg_islands$start + 1L
+
+# Summary of intervals before/after reduction
+cpg_interval_summary <- data.table(
+  stage   = c("before",          "after"),
+  n       = c(length(cgi_len_before), length(cgi_len_after)),
+  min_len = c(min(cgi_len_before),    min(cgi_len_after)),
+  mean_len= c(mean(cgi_len_before),   mean(cgi_len_after)),
+  max_len = c(max(cgi_len_before),    max(cgi_len_after))
+)
+
+cpg_interval_summary[]
+
+```
+
+```{r}
+# PWD on reduced CpG islands
+pwd_cgi <- run_all_pairs_one_interval_dt(
+  bed_paths,
+  pairs,
+  intervals_dt   = cpg_islands,
+  min_cov        = min_cov,
+  min_cpgs       = min_cpgs,
+  interval_chunk = interval_chunk
+)
+
+# Quick plot
+if (nrow(pwd_cgi)) {
+  plot_pwd(as.data.frame(pwd_cgi), "PWD — CpG islands")
+}
+
+```
+
+```{r}
+pwd_cgi_summary <- pwd_cgi %>%
+  as_tibble() %>%
+  mutate(feature = "CpG_island") %>%
+  group_by(feature, pair) %>%
+  summarise(
+    n_intervals = n(),
+    median_pwd  = median(pwd_mean, na.rm = TRUE),
+    wmean_pwd   = weighted.mean(pwd_mean, n_cpg, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+pwd_cgi_summary %>% print(n = nrow(.))
+
+```
+
+## Adding peakdata
+
+```{r}
+
+STD_CHR <- c(paste0("chr", 1:22), "chrX", "chrY")
+
+read_tf_peaks <- function(path_tf_bed) {
+  # skip the 'track name="..."' header line
+  dt <- fread(
+    path_tf_bed,
+    sep         = "\t",
+    header      = FALSE,
+    skip        = 1L,
+    data.table  = TRUE,
+    showProgress = FALSE
+  )
+
+  # Give columns names (BED9-ish; tolerate extra columns)
+  setnames(dt, paste0("V", seq_len(ncol(dt))))
+  cols <- c("chr","start","end","anno","score","strand","thickStart","thickEnd","rgb")
+  setnames(dt, old = names(dt)[seq_along(cols)], new = cols)
+
+  # Keep standard chromosomes and clean coordinates
+  tf <- dt[
+    chr %chin% STD_CHR &
+      !is.na(start) & !is.na(end) & end > start
+  ]
+
+  # BED is 0-based half-open -> convert to 1-based inclusive
+  tf[, `:=`(
+    chr   = as.character(chr),
+    start = as.integer(start) + 1L,
+    end   = as.integer(end),
+    score = as.numeric(score),
+    anno  = as.character(anno)
+  )]
+
+  ## --------- parse annotation string ---------
+  # 1) TF name from "Name=...%20(@%20...);"  (allow internal %20 etc.)
+  #    capture lazily up to "%20(@"
+  m_name <- str_match(tf$anno, "Name=([^;]+?)%20\\(@")
+  tf_name_raw <- m_name[, 2]
+
+  # URL-decode (handles %20, %28, etc.)
+  tf_name_dec <- ifelse(
+    !is.na(tf_name_raw),
+    URLdecode(tf_name_raw),
+    NA_character_
+  )
+
+  # 1b) fallback: if Name= is missing, try hgn=HOXA6;
+  m_hgn  <- str_match(tf$anno, "hgn=([^;]+);")
+  hgn_raw <- m_hgn[, 2]
+  hgn_dec <- ifelse(
+    !is.na(hgn_raw),
+    URLdecode(hgn_raw),
+    NA_character_
+  )
+
+  tf_name_final <- ifelse(
+    !is.na(tf_name_dec) & tf_name_dec != "",
+    tf_name_dec,
+    hgn_dec
+  )
+
+  # 2) cell type from "cell%20type=...;"
+  m_ct   <- str_match(tf$anno, "cell%20type=([^;]+);")
+  ct_raw <- m_ct[, 2]
+
+  # URL-decode + clean trailing "cell line(s)"
+  cell_type_dec <- ifelse(
+    !is.na(ct_raw),
+    URLdecode(ct_raw),
+    NA_character_
+  )
+
+  cell_type_clean <- ifelse(
+    is.na(cell_type_dec),
+    NA_character_,
+    {
+      x <- cell_type_dec
+      # drop trailing "cell line" or "cell lines"
+      x <- gsub(" ?cell line(s)?$", "", x, ignore.case = TRUE)
+      trimws(x)
+    }
+  )
+
+  tf[, `:=`(
+    tf_name   = tf_name_final,
+    cell_type = cell_type_clean
+  )]
+
+  # final skinny table
+  tf_out <- tf[, .(chr, start, end, score, tf_name, cell_type)]
+
+  setkey(tf_out, chr, start, end)
+  tf_out
+}
+
+global_reduce_dt <- function(iv_dt) {
+  if (!nrow(iv_dt)) return(iv_dt[0])
+
+  # drop any weird rows up front
+  iv <- copy(iv_dt)[
+    !is.na(chr) & !is.na(start) & !is.na(end) & end >= start
+  ]
+
+  if (!nrow(iv)) return(iv[0])
+
+  # enforce integer & order
+  iv[, `:=`(
+    start = as.integer(start),
+    end   = as.integer(end)
+  )]
+  setorder(iv, chr, start, end)
+
+  out_list <- vector("list", length = length(unique(iv$chr)))
+  chrs <- unique(iv$chr)
+
+  for (i in seq_along(chrs)) {
+    ch <- chrs[i]
+    x  <- iv[chr == ch]
+    if (!nrow(x)) next
+
+    cur_start <- x$start[1]
+    cur_end   <- x$end[1]
+
+    res_chr <- vector("list", nrow(x))
+    k <- 1L
+
+    if (nrow(x) > 1L) {
+      for (j in 2:nrow(x)) {
+        s <- x$start[j]
+        e <- x$end[j]
+
+        # ultra-defensive: skip any NA row
+        if (is.na(s) || is.na(e)) next
+
+        if (s <= cur_end) {
+          # overlap → extend
+          if (e > cur_end) cur_end <- e
+        } else {
+          # new disjoint interval
+          res_chr[[k]] <- list(chr = ch,
+                               start = cur_start,
+                               end   = cur_end)
+          k <- k + 1L
+          cur_start <- s
+          cur_end   <- e
+        }
+      }
+    }
+
+    # last interval for this chr
+    res_chr[[k]] <- list(chr = ch, start = cur_start, end = cur_end)
+    res_chr <- res_chr[seq_len(k)]
+    out_list[[i]] <- rbindlist(res_chr)
+  }
+
+  out <- rbindlist(out_list, use.names = TRUE, fill = TRUE)
+  setkey(out, chr, start, end)
+  out
+}
+
+
+interval_summary <- function(dt) {
+  if (!nrow(dt)) {
+    return(data.table(
+      n        = 0L,
+      min_len  = NA_real_,
+      max_len  = NA_real_,
+      mean_len = NA_real_
+    ))
+  }
+  len <- dt$end - dt$start + 1L
+  data.table(
+    n        = nrow(dt),
+    min_len  = min(len),
+    max_len  = max(len),
+    mean_len = mean(len)
+  )
+}
+
+```
+
+```{r}
+tf_path <- "data/Oth.Dig.10.AllAg.AllCell.bed"
+
+## 1) Read peaks with TF name + cell type
+tf_peaks_raw <- read_tf_peaks(tf_path)   # chr, start, end, score, tf_name, cell_type
+
+## 2) Per-TF summary (before any reduction)
+tf_peaks_raw[, len := end - start + 1L]   # interval length in bp
+
+tf_per_tf <- tf_peaks_raw[
+  , .(
+      n_peaks  = .N,
+      min_len  = min(len),
+      max_len  = max(len),
+      mean_len = mean(len)
+    ),
+  by = tf_name
+][order(-n_peaks)]
+
+n_tf <- nrow(tf_per_tf)
+
+cat("Number of unique TFs in file:", n_tf, "\n")
+# look at the top 20 TFs by number of peaks
+head(tf_per_tf, 20)
+
+## tf_peaks_raw already from read_tf_peaks()
+## columns: chr, start, end, score, tf_name, cell_type
+
+# keep only what's needed for interval summaries
+tf_iv_before <- tf_peaks_raw[, .(chr, start, end, tf_name)]
+
+## 1) per-TF summary BEFORE reduction
+tf_before_summary <- tf_iv_before[
+  , {
+      len <- end - start + 1L
+      .(
+        n        = .N,
+        min_len  = min(len),
+        max_len  = max(len),
+        mean_len = mean(len)
+      )
+    },
+  by = tf_name
+]
+
+## 2) reduce intervals *within each TF* (union of peaks per TF)
+reduce_by_tf <- function(dt) {
+  # clean once
+  dt_clean <- dt[
+    !is.na(tf_name) &
+    !is.na(chr) & !is.na(start) & !is.na(end) &
+    end >= start
+  ]
+
+  if (!nrow(dt_clean)) {
+    return(data.table(chr = character(),
+                      start = integer(),
+                      end   = integer(),
+                      tf_name = character()))
+  }
+
+  # split by tf_name, reduce within each TF
+  tf_list <- split(dt_clean[, .(chr, start, end)], dt_clean$tf_name)
+
+  res <- lapply(names(tf_list), function(tf) {
+    iv  <- tf_list[[tf]]
+    red <- global_reduce_dt(iv)
+    if (nrow(red)) {
+      red[, tf_name := tf]
+    } else {
+      NULL
+    }
+  })
+
+  rbindlist(res, use.names = TRUE, fill = TRUE)
+}
+
+tf_iv_after <- reduce_by_tf(tf_iv_before)
+
+## 3) per-TF summary AFTER reduction
+tf_after_summary <- tf_iv_after[
+  , {
+      len <- end - start + 1L
+      .(
+        n        = .N,
+        min_len  = min(len),
+        max_len  = max(len),
+        mean_len = mean(len)
+      )
+    },
+  by = tf_name
+]
+
+## 4) combine before/after into one table
+tf_summary_long <- rbind(
+  tf_before_summary[, stage := "before"],
+  tf_after_summary[,  stage := "after"]
+)
+
+# optional: order nicely
+setorder(tf_summary_long, tf_name, stage)
+
+tf_summary_long[]
+
+
+
+```
+
+```{r}
+# Prepare intervals for PWD: one row per (tf_name, interval)
+tf_iv_pwd <- copy(tf_iv_after)[
+  ,
+  `:=`(
+    name = paste0(tf_name, "_", seq_len(.N)),  # unique interval ID within TF
+    gene = tf_name                             # TF label
+  ),
+  by = tf_name
+]
+
+setkey(tf_iv_pwd, chr, start, end)
+
+pwd_tf <- run_all_pairs_one_interval_dt(
+  bed_paths,
+  pairs,
+  tf_iv_pwd,
+  min_cov       = min_cov,
+  min_cpgs      = min_cpgs,
+  interval_chunk = interval_chunk
+)
+
+if (nrow(pwd_tf)) {
+  plot_pwd(as.data.frame(pwd_tf),
+           "PWD — all TF peaks (per interval)")
+}
+
+top10_tf <- tf_per_tf[order(-n_peaks)][1:10, tf_name]
+top10_tf
+
+pwd_tf_top10 <- vector("list", length(top10_tf))
+names(pwd_tf_top10) <- top10_tf
+
+for (i in seq_along(top10_tf)) {
+  tf <- top10_tf[i]
+  message("Running PWD for TF: ", tf)
+
+  iv_tf <- tf_iv_pwd[gene == tf]  # only that TF's intervals
+
+  pwd_tf_top10[[i]] <- run_all_pairs_one_interval_dt(
+    bed_paths,
+    pairs,
+    iv_tf,
+    min_cov       = min_cov,
+    min_cpgs      = min_cpgs,
+    interval_chunk = interval_chunk
+  )[, tf_name := tf]
+}
+
+pwd_tf_top10 <- rbindlist(pwd_tf_top10, use.names = TRUE, fill = TRUE)
+
+
+plot_pwd_tf <- function(df, tf) {
+  ggplot(df, aes(x = pair, y = pwd_mean)) +
+    geom_violin(trim = TRUE, scale = "width") +
+    geom_boxplot(width = 0.12, outlier.size = 0.3) +
+    labs(
+      title = paste0("PWD — TF peaks: ", tf),
+      x = NULL,
+      y = "PWD (mean |Δβ| per interval)"
+    ) +
+        stat_summary(
+      fun = "mean",
+      geom = "point",
+      colour = "red",
+      size = 1.5
+    ) +
+    theme_bw(base_size = 12) +
+    coord_cartesian(ylim = c(0, 0.3)) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+for (tf in top10_tf) {
+  df_tf <- as.data.frame(pwd_tf_top10[tf_name == tf])
+  if (nrow(df_tf)) {
+    print(plot_pwd_tf(df_tf, tf))
+    # ggsave(glue::glue("PWD_TF_{tf}.pdf"), width = 10, height = 5)
+  }
+}
+
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+
+## helper: summarise a PWD table to one point per pair
+summarise_pwd <- function(pwd_dt, feature_label) {
+  as_tibble(pwd_dt) %>%
+    group_by(pair) %>%
+    summarise(
+      mean_pwd = mean(pwd_mean, na.rm = TRUE),
+      .groups  = "drop"
+    ) %>%
+    mutate(feature = feature_label)
+}
+
+## 1) build summary rows for each definition you have
+pwd_sum_tx      <- summarise_pwd(pwd_tx,      "tx")
+pwd_sum_cds     <- summarise_pwd(pwd_cds,     "cds")
+pwd_sum_tss500  <- summarise_pwd(pwd_tss500,  "TSS±500")
+pwd_sum_tss1000 <- summarise_pwd(pwd_tss1000, "TSS±1000")
+pwd_sum_ccre    <- summarise_pwd(pwd_ccre,    "cCRE")
+pwd_sum_cgi     <- summarise_pwd(pwd_cgi,     "CpG_island")
+pwd_sum_tf      <- summarise_pwd(pwd_tf,      "TF_peak")
+
+## 2) bind everything into one long table
+pwd_all_summary <- bind_rows(
+  pwd_sum_tx,
+  pwd_sum_cds,
+  pwd_sum_tss500,
+  pwd_sum_tss1000,
+  pwd_sum_ccre,
+  pwd_sum_cgi,
+  pwd_sum_tf
+)
+
+## 3) nice factor ordering for x and legend
+pair_levels <- pwd_all_summary$pair %>% unique()
+feature_levels <- c("tx","cds","TSS±500","TSS±1000","cCRE","CpG_island","TF_peak")
+
+pwd_all_summary <- pwd_all_summary %>%
+  mutate(
+    pair    = factor(pair, levels = pair_levels),
+    feature = factor(feature, levels = feature_levels)
+  )
+
+## 4) plot: 7 coloured dots per pair
+ggplot(pwd_all_summary,
+       aes(x = pair, y = mean_pwd, colour = feature)) +
+  # all points share the exact same x per pair
+  geom_point(size = 2.4, alpha = 0.85) +
+  labs(
+    x = NULL,
+    y = "Mean PWD (mean |Δβ| per interval)",
+    colour = "Genomic context",
+    title = "Methylation conservation across genomic contexts and sample pairs"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank()
+  )
+
+
+```
+
+- gene by gene bases (cCRE find the closest gene - bioconductor)
+- x-conservation, 
+- change the cell-line doesnt change the methyaltion 

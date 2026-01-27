@@ -1,0 +1,59 @@
+---
+title: "ENST_dataquality_check"
+output: html_document
+date: "2025-11-20"
+---
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(glue)
+  library(tibble)
+  library(stringr)
+})
+
+```
+
+```{r}
+k2rs <- fread("knownToRefSeq.txt", header = FALSE, sep = "\t",
+              col.names = c("kgID","refseq_id")) %>%
+  as_tibble() %>%
+  mutate(
+    kgID      = sub("\\.\\d+$","", kgID),
+    refseq_id = sub("\\.\\d+$","", refseq_id)
+  ) %>%
+  filter(grepl("^(NM|NR|XM|XR)_", refseq_id)) %>%
+  distinct()
+
+## ENST → RefSeq (many-to-many)
+ens_to_refseq <- known_dt %>%
+  dplyr::select(enst = name) %>%
+  left_join(k2rs, by = c("enst" = "kgID")) %>%
+  filter(!is.na(refseq_id)) %>%
+  distinct()
+
+## ------------------------------------------------------------
+## 3) Build a RefSeqALL universe from UCSC coordinates
+##    (curated refGene + predicted/curated ncbiRefSeq)
+##    Schema matches your target: name chrom strand txStart txEnd cdsStart cdsEnd exonCount exonStarts exonEnds score name2 ...
+## ------------------------------------------------------------
+read_ref_like <- function(path) {
+  # refGene/ncbiRefSeq have 16 columns; use friendly names
+  fread(path, header = FALSE, sep = "\t", quote = "", na.strings = c("", "NA"),
+        col.names = c("bin","name","chrom","strand","txStart","txEnd","cdsStart","cdsEnd",
+                      "exonCount","exonStarts","exonEnds","score","name2","cdsStartStat","cdsEndStat","exonFrames")) %>%
+    as_tibble() %>%
+    mutate(name = sub("\\.\\d+$","", name))
+}
+refGene_tbl   <- read_ref_like("refGene.txt")
+ncbiRefSeq_tbl<- read_ref_like("ncbiRefSeq.txt")
+
+refseq_all <- bind_rows(refGene_tbl, ncbiRefSeq_tbl) %>%
+  filter(grepl("^(NM|NR|XM|XR)_", name)) %>%
+  arrange(name, chrom, txStart) %>%
+  distinct(name, .keep_all = TRUE)
+```
+
