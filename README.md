@@ -100,6 +100,22 @@ This file integrates **gene‑level expression plasticity** and **gene‑level m
 
 These files define how transcripts, genes, TSSs, and intervals are mapped. They are critical for correctness but are not meant to be run repeatedly once validated.
 
+### `Refseq_master.Rmd`
+
+🚨 **Master Data Generation Pipeline**
+
+This is the consolidated upstream script that generates the fundamental data structures for the project. It supersedes older mapping scripts by standardizing the **5'–most** rule across all genomic contexts.
+
+* **Builds `refseq_all`:** Downloads and merges UCSC RefSeq and KnownGene tables into a single master annotation.
+* **Enforces 5'–Most Rule:** Rigorously selects the single 5'–most transcript per gene (strand–aware) to define the canonical gene start.
+* **Defines Intervals:** Generates coordinates for:
+    * **Promoters:** `TSS500`, `TSS1000`
+    * **Gene Bodies:** `TxBody`, `CDS`
+    * **Regulatory Features:** `pELS`, `dELS`, `CGI`, `TF_peaks` (mapped to the nearest gene)
+* **Calculates PWD:** Runs the memory–efficient, chunked PWD calculation engine for **all** defined intervals and sample pairs.
+
+**Output:** Saves RDS files (e.g., `pwd_TSS500.rds`, `pwd_pELS.rds`) to the `/data` folder for downstream analysis.
+
 ### `TSS_gene_mapping.Rmd`
 
 Defines the **gene‑level TSS representation** used throughout the project.
@@ -163,6 +179,21 @@ These files were created to **resolve transcript‑to‑gene mapping issues** an
   * Potential gene inflation or loss
 
 This file does **not** generate final analysis outputs, but documents decisions made upstream.
+
+### `5prime_validation.Rmd`
+
+**Methodological Validation: Why the 5'–most TSS?**
+
+This notebook scientifically validates the decision to use the 5'–most TSS as the representative promoter for a gene, rather than alternative downstream TSSs.
+
+* **Multi–TSS Analysis:** Identifies genes with multiple unique transcription start sites.
+* **Divergence Comparison:** Compares the methylation divergence (PWD) of the 5'–most TSS against downstream alternative TSSs.
+* **Sensitivity Metrics:**
+    * **Distance Decay:** Plots PWD as a function of distance from the 5' end.
+    * **Rank Correlation:** Checks if the 5'–most TSS consistently captures the lowest (or most representative) divergence.
+    * **Delta PWD:** Quantifies the error margin when the 5'–most TSS is *not* the most conserved site.
+
+**Key Insight:** Provides statistical justification that phenotypic plasticity is best captured by the canonical 5' start site, with 7% error rate.
 
 ---
 
