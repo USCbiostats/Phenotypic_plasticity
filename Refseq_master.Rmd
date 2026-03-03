@@ -1,0 +1,482 @@
+---
+title: 'Master PWD Analysis: Phenotypic Plasticity in CRC'
+output: html_document
+date: "2026-03-03"
+---
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(stringr)
+  library(GenomicRanges)
+  library(IRanges)
+  library(BiocParallel)
+  library(utils)
+})
+
+# --- Configuration ---
+# Parallel workers (adjust based on your RAM)
+N_CORES <- 4 
+data.table::setDTthreads(N_CORES)
+
+# Standard Chromosomes
+STD_CHR <- c(paste0("chr", 1:22), "chrX", "chrY")
+
+# Create data directory if it doesn't exist
+if (!dir.exists("data")) dir.create("data")
+
+# --- Helper: Download UCSC Data if missing ---
+ucsc_db <- "[http://hgdownload.soe.ucsc.edu/goldenPath/hg38/database](http://hgdownload.soe.ucsc.edu/goldenPath/hg38/database)"
+maybe_get <- function(fname) {
+  gz <- paste0(fname, ".gz")
+  if (!file.exists(fname) && !file.exists(gz)) {
+    message("Downloading ", gz)
+    download.file(paste0(ucsc_db, "/", gz), destfile = gz, mode = "wb", quiet = TRUE)
+    R.utils::gunzip(gz, overwrite = TRUE, remove = FALSE)
+  } else if (file.exists(gz) && !file.exists(fname)) {
+    R.utils::gunzip(gz, overwrite = TRUE, remove = FALSE)
+  }
+}
+```
+
+
+## Build Refseq_all
+```{r}
+# 1. Ensure files exist
+maybe_get("knownToRefSeq.txt")
+maybe_get("refGene.txt")
+maybe_get("ncbiRefSeq.txt")
+# Note: "ucsc_hg38_gene_known_genecodeV48" is assumed to be present locally as per your upload.
+f_known <- "data/ucsc_hg38_gene_known_genecodeV48" 
+
+# 2. Helper to read RefSeq-like tables
+read_ref_like <- function(path) {
+  if (!file.exists(path)) return(data.table())
+  
+  # Read ALL columns first to avoid 'select' vs 'col.names' conflict
+  dt <- fread(path, header = FALSE, sep = "\t", quote = "", na.strings = c("", "NA"),
+              col.names = c("bin","name","chrom","strand","txStart","txEnd","cdsStart","cdsEnd",
+                            "exonCount","exonStarts","exonEnds","score","name2","cdsStartStat","cdsEndStat","exonFrames"))
+  
+  # Then select and clean using dplyr (or data.table)
+  dt %>%
+    as_tibble() %>%
+    dplyr::select(name, chrom, strand, txStart, txEnd, cdsStart, cdsEnd, name2) %>%
+    mutate(name = sub("\\.\\d+$", "", name))
+}
+
+# 3. Read and Merge
+message("Building refseq_all...")
+
+# A) Read RefSeq tables
+refGene     <- read_ref_like("refGene.txt")
+ncbiRefSeq  <- read_ref_like("ncbiRefSeq.txt")
+
+refseq_combined <- bind_rows(refGene, ncbiRefSeq) %>%
+  filter(chrom %in% STD_CHR, grepl("^(NM|NR|XM|XR)_", name)) %>%
+  distinct(name, .keep_all = TRUE)
+
+# B) Read KnownGene (Gencode/ENST) if available to supplement
+if (file.exists(f_known)) {
+  known_dt <- fread(f_known, sep="\t", header=TRUE) 
+  
+  # Normalize columns
+  nm <- names(known_dt)
+  if(!"name" %in% nm) setnames(known_dt, nm[grepl("name", nm, ignore.case=TRUE)][1], "name")
+  known_dt[, name := sub("\\.\\d+$", "", name)]
+  
+  # Map ENST to RefSeq via knownToRefSeq
+  k2rs <- fread("knownToRefSeq.txt", header=FALSE, col.names=c("kgID","refseq_id"))
+  k2rs[, `:=`(kgID = sub("\\.\\d+$","", kgID), refseq_id = sub("\\.\\d+$","", refseq_id))]
+  
+  # Only keep ENSTs that map to a RefSeq ID we don't already have? 
+  # For simplicity based on your request, we often prioritize the direct RefSeq tables, 
+  # but here we simply output the combined RefSeq table as the master 'refseq_all'.
+  # If you specifically need ENST coordinates mapped to RefSeq IDs, logic can be added here.
+}
+
+# Final Cleanup of refseq_all
+refseq_all <- refseq_combined %>%
+  filter(!is.na(name2) & name2 != "") %>%
+  mutate(
+    txStart  = as.integer(txStart),
+    txEnd    = as.integer(txEnd),
+    cdsStart = as.integer(cdsStart),
+    cdsEnd   = as.integer(cdsEnd)
+  ) %>%
+  as.data.table()
+
+# Save for future use
+# saveRDS(refseq_all, "data/refseq_all.rds")
+message("refseq_all built with ", nrow(refseq_all), " transcripts and ", length(unique(refseq_all$name2)), " genes")
+```
+
+## Define Pwd intervals
+```{r}
+# ==============================================================================
+# 3. Define Intervals (5'-Most Rule & Mapping)
+# ==============================================================================
+
+# --- Helper: Select 5'-most transcript per gene ---
+get_5prime_most <- function(dt) {
+  # Use strand[1] to handle rare multi-strand annotation artifacts safely
+  dt_best <- dt[, {
+    if (strand[1] == "+") {
+      .SD[which.min(txStart)]
+    } else {
+      .SD[which.max(txEnd)]
+    }
+  }, by = name2] 
+  return(dt_best)
+}
+
+# 1. Filter refseq_all to the single best transcript per gene
+refseq_best <- get_5prime_most(refseq_all)
+message("Reduced refseq_all to ", nrow(refseq_best), " unique 5'-most genes.")
+
+# --- Define Direct Gene Intervals ---
+
+# A) TSS +/- 500 (1-based coords)
+make_tss_window <- function(df, flank=500) {
+  df[, {
+    tss <- if (strand == "+") txStart + 1L else txEnd
+    list(chr=chrom, start=max(1L, tss - flank), end=tss + flank)
+  }, by = .(gene = name2)]
+}
+
+iv_tss500  <- make_tss_window(refseq_best, 500)
+iv_tss1000 <- make_tss_window(refseq_best, 1000)
+
+# B) Transcript Body (txStart to txEnd)
+iv_tx <- refseq_best[, .(chr=chrom, start=txStart+1L, end=txEnd, gene=name2)]
+
+# C) CDS (coding sequence only)
+iv_cds <- refseq_best[!is.na(cdsStart) & !is.na(cdsEnd) & cdsEnd > cdsStart, 
+                      .(chr=chrom, start=cdsStart+1L, end=cdsEnd, gene=name2)]
+
+# --- Helper: Gene Mapping Reference (GRanges) ---
+gr_gene_tss <- GRanges(
+  seqnames = iv_tss500$chr,
+  ranges   = IRanges(start = (iv_tss500$start + iv_tss500$end)/2, width=1),
+  gene     = iv_tss500$gene
+)
+
+# --- Define Genomic Feature Intervals (cCRE, CGI, TF) ---
+
+# Generic Mapper: Takes any DT with (chr, start, end) and maps to nearest Gene TSS
+map_to_nearest_gene <- function(dt, gr_ref) {
+  if (nrow(dt) == 0) return(dt)
+  
+  # Ensure standard chromosomes
+  dt <- dt[chr %in% STD_CHR]
+  
+  # Convert to GRanges
+  gr_feat <- GRanges(dt$chr, IRanges(dt$start, dt$end))
+  
+  # Find nearest gene
+  hits <- distanceToNearest(gr_feat, gr_ref, ignore.strand=TRUE)
+  
+  # Assign Gene and Distance
+  dt[queryHits(hits), `:=`(
+    nearest_gene = mcols(gr_ref)$gene[subjectHits(hits)],
+    dist_to_tss  = mcols(hits)$distance
+  )]
+  
+  return(dt[!is.na(nearest_gene)])
+}
+
+# 1. cCREs (Read & Map)
+message("Processing cCREs...")
+path_ccre <- "data/large_intestine.noccl.cCREs.bed"
+
+if (file.exists(path_ccre)) {
+  # Standard BED reading
+  dt_ccre <- fread(path_ccre, header=FALSE, sep="\t", fill=TRUE)
+  
+  # Handle columns safely (SCREEN format usually has 10+ cols)
+  # V1=chr, V2=start, V3=end. 
+  # cCRE class (pELS/dELS) is often in V10 or V12 depending on version.
+  # We will try to auto-detect or default to V10.
+  keep_cols <- c("V1","V2","V3")
+  if ("V12" %in% names(dt_ccre)) keep_cols <- c(keep_cols, "V12") else if ("V10" %in% names(dt_ccre)) keep_cols <- c(keep_cols, "V10")
+  
+  dt_ccre <- dt_ccre[, ..keep_cols]
+  setnames(dt_ccre, 1:3, c("chr","start","end"))
+  
+  # Rename class column to 'feature_class'
+  if (ncol(dt_ccre) >= 4) setnames(dt_ccre, 4, "feature_class") else dt_ccre[, feature_class := "Unknown"]
+  
+  # Fix 0-based
+  dt_ccre[, start := start + 1L]
+  
+  # Map
+  dt_ccre_mapped <- map_to_nearest_gene(dt_ccre, gr_gene_tss)
+} else {
+  dt_ccre_mapped <- data.table()
+}
+
+# 2. CpG Islands (Read & Map)
+message("Processing CGIs...")
+path_cgi <- "data/ucsc_cpgislandext.tsv"
+
+if (file.exists(path_cgi)) {
+  dt_cgi <- fread(path_cgi, header=TRUE) # UCSC usually has header
+  # Standardize names
+  setnames(dt_cgi, c("chrom","chromStart","chromEnd"), c("chr","start","end"), skip_absent=TRUE)
+  
+  # Fix 0-based
+  dt_cgi[, start := start + 1L]
+  
+  # Map
+  dt_cgi_mapped <- map_to_nearest_gene(dt_cgi, gr_gene_tss)
+} else {
+  dt_cgi_mapped <- data.table()
+}
+
+# 3. TF Peaks (Robust Custom Reader from User)
+message("Processing TFs...")
+read_tf_peaks_robust <- function(path) {
+  # 1. Read with skip=1 to avoid track header
+  dt <- fread(path, sep="\t", header=FALSE, skip=1L, fill=TRUE, data.table=TRUE)
+  
+  # 2. Assign standard BED names up to what is present
+  setnames(dt, paste0("V", seq_len(ncol(dt))))
+  bed_cols <- c("chr","start","end","anno","score","strand","thickStart","thickEnd","rgb")
+  # Only rename columns that actually exist
+  use_cols <- intersect(names(dt), paste0("V", 1:length(bed_cols)))
+  setnames(dt, use_cols, bed_cols[1:length(use_cols)])
+  
+  # 3. Filter / Fix Coords
+  dt <- dt[chr %in% STD_CHR & !is.na(start) & !is.na(end)]
+  dt[, start := start + 1L] # 0-based to 1-based
+  
+  # 4. Parse TF Name from 'anno' string (Name=TF_NAME;...)
+  # We extract "Name=XYZ" using regex
+  dt[, tf_name := str_match(anno, "Name=([^;]+)")[,2]]
+  
+  # If Name is missing (URL encoded stuff), try fallback or raw cleanup
+  # For simplicity in this master script, we take the best attempt:
+  dt[is.na(tf_name), tf_name := "Unknown_TF"]
+  
+  # Decode URL characters if needed (simple version)
+  dt[, tf_name := gsub("%20|%28|%29", "", tf_name)] 
+  
+  return(dt[, .(chr, start, end, tf_name)])
+}
+
+path_tf <- "data/Oth.Dig.10.AllAg.AllCell.bed"
+
+if (file.exists(path_tf)) {
+  dt_tf <- read_tf_peaks_robust(path_tf)
+  dt_tf_mapped <- map_to_nearest_gene(dt_tf, gr_gene_tss)
+} else {
+  dt_tf_mapped <- data.table()
+}
+```
+
+
+## PWD calculation
+
+```{r}
+# --- Configuration for PWD ---
+MIN_COV <- 8L
+MIN_CPGS <- 1L
+
+# --- Function: Read Methylation BED ---
+read_methyl_bed <- function(path) {
+  # Expects: chr, start, end, beta, cov, meth, unmeth
+  d <- fread(path, select=1:5, col.names=c("chr","start","end","beta","cov"))
+  d <- d[chr %in% STD_CHR & cov >= MIN_COV]
+  d[, start := start + 1L] # 1-based
+  setkey(d, chr, start)
+  return(d)
+}
+
+# --- Function: Calculate Gene-Level PWD ---
+# interval_dt must have: chr, start, end, gene (or nearest_gene)
+calc_gene_pwd_pair <- function(pathA, pathB, interval_dt, gene_col="gene") {
+  
+  # 1. Read Data
+  A <- read_methyl_bed(pathA)
+  B <- read_methyl_bed(pathB)
+  
+  # 2. Intersect Samples (Keep only common CpGs)
+  common <- merge(A, B, by=c("chr", "start"), suffixes=c("_A", "_B"))
+  if (nrow(common) == 0) return(NULL)
+  
+  # 3. Overlap with Intervals (Iterate by Chromosome to save RAM)
+  chrs <- intersect(unique(interval_dt$chr), unique(common$chr))
+  res_list <- list()
+  
+  for (k in chrs) {
+    # Subset
+    ints_k <- interval_dt[chr == k]
+    cpgs_k <- common[chr == k]
+    
+    if (nrow(ints_k) == 0 || nrow(cpgs_k) == 0) next
+    
+    # Fast overlap (foverlaps requires keys)
+    # CpGs are points: start=end
+    cpgs_k[, end := start]
+    setkey(cpgs_k, chr, start, end)
+    setkey(ints_k, chr, start, end)
+    
+    # Overlap
+    ov <- foverlaps(cpgs_k, ints_k, nomatch=0L)
+    
+    # Calculate PWD per CpG: |BetaA - BetaB|
+    ov[, pwd_site := abs(beta_A - beta_B)]
+    
+    # Aggregate to Gene Level
+    # Weighted Mean: We weight by number of CpGs? 
+    # Usually: Mean of PWDs in the gene.
+    # If the interval_dt has multiple intervals per gene (e.g. cCREs),
+    # this aggregation pools ALL CpGs in ALL intervals for that gene.
+    
+    agg <- ov[, .(
+      sum_pwd = sum(pwd_site, na.rm=TRUE),
+      n_cpg   = .N
+    ), by = get(gene_col)] # Group by Gene
+    
+    res_list[[k]] <- agg
+  }
+  
+  # Combine chromosomes and re-aggregate (since a gene might span chrs, though unlikely)
+  final <- rbindlist(res_list)
+  final <- final[, .(
+    mean_pwd = sum(sum_pwd) / sum(n_cpg),
+    n_cpg    = sum(n_cpg)
+  ), by = get] # 'get' is the gene column
+  
+  setnames(final, "get", "gene")
+  return(final)
+}
+
+# --- Wrapper: Run All Pairs for an Interval Set ---
+run_pwd_pipeline <- function(interval_dt, feature_name, pairs, bed_paths, gene_col="gene") {
+  
+  all_res <- list()
+  
+  for (p_name in names(pairs)) {
+    s1 <- pairs[[p_name]][1]
+    s2 <- pairs[[p_name]][2]
+    
+    message("  Processing ", feature_name, " : ", p_name)
+    
+    res <- calc_gene_pwd_pair(bed_paths[[s1]], bed_paths[[s2]], interval_dt, gene_col)
+    
+    if (!is.null(res)) {
+      res[, pair := p_name]
+      res[, feature := feature_name]
+      all_res[[p_name]] <- res
+    }
+    gc() # Clean memory
+  }
+  
+  out <- rbindlist(all_res)
+  
+  # Save immediately
+  save_path <- paste0("data/pwd_", feature_name, ".rds")
+  saveRDS(out, save_path)
+  
+  return(out)
+}
+```
+
+## Exercution
+```{r}
+# --- Define Sample Map ---
+# Update paths to match your local files
+bed_paths <- c(
+  EN = "data/EN.bed", IN = "data/IN.bed", JN = "data/JN.bed",
+  PA = "data/PA.bed", PB = "data/PB.bed",
+  SA = "data/SA.bed", SB = "data/SB.bed",
+  XA = "data/XA.bed", XB = "data/XB.bed",
+  DA = "data/DA.bed", DB = "data/DB.bed",
+  EA = "data/EA.bed", EB = "data/EB.bed",
+  FA = "data/FA.bed", FB = "data/FB.bed",
+  HA = "data/HA.bed", HB = "data/HB.bed",
+  IA = "data/IA.bed", IB = "data/IB.bed",
+  JA = "data/JA.bed", JB = "data/JB.bed",
+  KA = "data/KA.bed", KB = "data/KB.bed",
+  MA = "data/MA.bed", MB = "data/MB.bed"
+)
+
+# --- Define Pairs ---
+pairs <- list(
+  "Normal EN-IN" = c("EN","IN"), "Normal EN-JN" = c("EN","JN"), "Normal IN-JN" = c("IN","JN"),
+  "Adenoma PA-PB"= c("PA","PB"), "Adenoma SA-SB"= c("SA","SB"), "Adenoma XA-XB"= c("XA","XB"),
+  "CRC DA-DB"    = c("DA","DB"), "CRC EA-EB"    = c("EA","EB"), "CRC FA-FB"    = c("FA","FB"),
+  "CRC HA-HB"    = c("HA","HB"), "CRC IA-IB"    = c("IA","IB"), "CRC JA-JB"    = c("JA","JB"),
+  "CRC KA-KB"    = c("KA","KB"), "CRC MA-MB"    = c("MA","MB")
+)
+
+# --- Run Calculations ---
+
+# 1. Direct Gene Features
+message("Running PWD for TSS500...")
+pwd_tss500  <- run_pwd_pipeline(iv_tss500,  "TSS500",  pairs, bed_paths, "gene")
+
+message("Running PWD for TSS1000...")
+pwd_tss1000 <- run_pwd_pipeline(iv_tss1000, "TSS1000", pairs, bed_paths, "gene")
+
+message("Running PWD for TxBody...")
+pwd_tx      <- run_pwd_pipeline(iv_tx,      "tx",      pairs, bed_paths, "gene")
+
+message("Running PWD for CDS...")
+pwd_cds     <- run_pwd_pipeline(iv_cds,     "cds",     pairs, bed_paths, "gene")
+
+# 2. Genomic Features (Mapped to Nearest Gene)
+
+# pELS / dELS (Split from cCREs)
+# Ensure column name matches your BED file's class column. Assuming 'ccre_group' or 'V10'
+if ("ccre_group" %in% names(dt_ccre_all)) {
+  iv_pels <- dt_ccre_all[ccre_group == "pELS"]
+  iv_dels <- dt_ccre_all[ccre_group == "dELS"]
+  
+  message("Running PWD for pELS...")
+  pwd_pels <- run_pwd_pipeline(iv_pels, "pELS", pairs, bed_paths, "nearest_gene")
+  
+  message("Running PWD for dELS...")
+  pwd_dels <- run_pwd_pipeline(iv_dels, "dELS", pairs, bed_paths, "nearest_gene")
+}
+
+message("Running PWD for CpG Islands...")
+pwd_cgi <- run_pwd_pipeline(dt_cgi, "CGI", pairs, bed_paths, "nearest_gene")
+
+message("Running PWD for TFs...")
+pwd_tf  <- run_pwd_pipeline(dt_tf,  "TF",  pairs, bed_paths, "nearest_gene")
+```
+
+
+## Basic summary
+
+```{r}
+# Collect all generated objects
+all_pwd_frames <- list(
+  pwd_tss500, pwd_tss1000, pwd_tx, pwd_cds, 
+  if(exists("pwd_pels")) pwd_pels else NULL,
+  if(exists("pwd_dels")) pwd_dels else NULL,
+  pwd_cgi, pwd_tf
+)
+
+# Bind
+master_summary_tbl <- rbindlist(all_pwd_frames, use.names=TRUE, fill=TRUE)
+
+# Summarize
+summary_stats <- master_summary_tbl[, .(
+  N_Genes = uniqueN(gene),
+  Mean_PWD = mean(mean_pwd, na.rm=TRUE),
+  Median_PWD = median(mean_pwd, na.rm=TRUE),
+  Avg_CpGs_Per_Gene = mean(n_cpg, na.rm=TRUE)
+), by = .(feature, pair)]
+
+print(summary_stats)
+write_csv(summary_stats, "data/pwd_summary_stats.csv")
+
+message("Processing Complete. All gene-level PWD files saved to /data.")
+```
+

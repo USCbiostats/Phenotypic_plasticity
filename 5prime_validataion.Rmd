@@ -1,0 +1,920 @@
+---
+title: "5'_validation"
+output: html_document
+date: "2026-02-17"
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+})
+
+# ----------------------------
+# User params
+# ----------------------------
+flank <- 500L                      # +/- flank around TSS
+out_prefix <- "refseq_tss_overview" # output file prefix (csv + png)
+keep_std_chr <- TRUE               # keep chr1-22, chrX, chrY by default
+
+STD_CHR <- c(paste0("chr", 1:22), "chrX", "chrY")
+
+# ---- Read refseq_all from disk ----
+get_refseq_all <- function(rds = "data/refseq_all.rds", csv = "data/refseq_all.csv") {
+  if (file.exists(rds)) {
+    x <- readRDS(rds)
+    return(x)
+  }
+  if (file.exists(csv)) {
+    x <- data.table::fread(csv, data.table = FALSE)
+    # enforce integer columns if present
+    for (nm in intersect(c("txStart","txEnd","cdsStart","cdsEnd","exonCount"), names(x))) {
+      x[[nm]] <- as.integer(x[[nm]])
+    }
+    return(x)
+  }
+  stop("refseq_all not found: ", rds, " or ", csv)
+}
+
+refseq_all <- get_refseq_all()
+
+# ----------------------------
+# 0) Normalize refseq_all columns + compute transcript-level TSS
+# ----------------------------
+rs <- as.data.table(refseq_all)
+
+# normalize chr column name to "chr"
+if (!("chr" %in% names(rs))) {
+  chr_col <- names(rs)[tolower(names(rs)) %in% c("chrom", "chr")][1]
+  if (is.na(chr_col)) stop("refseq_all: cannot find chrom/chr column")
+  setnames(rs, chr_col, "chr")
+}
+
+need <- c("chr", "txStart", "txEnd", "strand", "name2")
+if (!all(need %in% names(rs))) {
+  stop("refseq_all missing: ", paste(setdiff(need, names(rs)), collapse = ", "))
+}
+
+# basic cleaning
+rs <- rs[
+  !is.na(name2) & name2 != "" &
+    !is.na(chr) & !is.na(txStart) & !is.na(txEnd) &
+    !is.na(strand) & strand %in% c("+", "-") &
+    txEnd >= txStart
+]
+
+if (keep_std_chr) {
+  rs <- rs[chr %chin% STD_CHR]
+}
+
+# TSS (1-based): + strand: txStart + 1; - strand: txEnd
+. <- rs[, tss := fifelse(strand == "-", as.integer(txEnd), as.integer(txStart) + 1L)]
+. <- rs[, tss := as.integer(tss)]
+
+# transcript-level +/- flank window
+# Assigning to a null/dummy variable prevents the table from printing
+. <- rs[, `:=`(
+  win_start = pmax(1L, tss - flank),
+  win_end   = tss + flank
+)]
+
+cat("Rows (transcripts) after cleaning:", nrow(rs), "\n")
+cat("Unique genes:", uniqueN(rs$name2), "\n\n")
+
+
+# ----------------------------
+# 1) Distribution: transcripts per gene
+# ----------------------------
+tx_per_gene <- rs[, .N, by = .(gene = name2)][order(-N)]
+setnames(tx_per_gene, "N", "n_tx")
+
+# Summary stats
+tx_stats <- tx_per_gene[, .(
+  n_genes = .N,
+  mean_tx = mean(n_tx),
+  median_tx = median(n_tx),
+  p05 = quantile(n_tx, 0.05),
+  p95 = quantile(n_tx, 0.95),
+  max_tx = max(n_tx)
+)]
+print(tx_stats)
+
+# --- How many genes have 1 transcript vs >1? ---
+tx_counts <- tx_per_gene[, .(
+  n_genes_total = .N,
+  n_genes_1tx   = sum(n_tx == 1),
+  n_genes_gt1tx = sum(n_tx > 1),
+  frac_1tx      = sum(n_tx == 1) / .N,
+  frac_gt1tx    = sum(n_tx > 1) / .N
+)]
+print(tx_counts)
+
+
+tss_per_gene <- rs[, .(n_unique_tss = uniqueN(tss)), by = .(gene = name2)]
+tss_counts2 <- tss_per_gene[, .(
+  n_genes_total = .N,
+  n_genes_1tss   = sum(n_unique_tss == 1),
+  n_genes_gt1tss = sum(n_unique_tss > 1),
+  frac_1tss      = sum(n_unique_tss == 1) / .N,
+  frac_gt1tss    = sum(n_unique_tss > 1) / .N
+)]
+print(tss_counts2)
+```
+
+
+```{r}
+# ----------------------------
+# 2) Within-gene TSS dispersion
+# ----------------------------
+
+# (a) per-gene range
+tss_range <- rs[, .(
+  n_tx = .N,
+  tss_min = min(tss),
+  tss_max = max(tss),
+  tss_range_bp = max(tss) - min(tss)
+), by = .(gene = name2)][order(-tss_range_bp)]
+
+range_stats <- tss_range[, .(
+  n_genes = .N,
+  mean_range = mean(tss_range_bp),
+  median_range = median(tss_range_bp),
+  p05 = quantile(tss_range_bp, 0.05),
+  p95 = quantile(tss_range_bp, 0.95),
+  max_range = max(tss_range_bp)
+)]
+print(range_stats)
+
+# (b) adjacent diffs
+adj_diffs <- rs[order(name2, chr, tss)][
+  , .(adj_diff_bp = diff(unique(tss))), by = .(gene = name2)
+][!is.na(adj_diff_bp)]
+
+adj_stats <- adj_diffs[, .(
+  n_diffs = .N,
+  mean_adj = mean(adj_diff_bp),
+  median_adj = median(adj_diff_bp),
+  p05 = quantile(adj_diff_bp, 0.05),
+  p95 = quantile(adj_diff_bp, 0.95),
+  max_adj = max(adj_diff_bp)
+)]
+print(adj_stats)
+
+# Then adj_stats summarizes the distribution of those adjacent gaps across all genes (pooled together).
+# 
+# n_diffs = 30302 = total number of adjacent gaps you observed across all genes
+# median_adj = 1096 bp = typical spacing between alternative TSS when a gene has >1 unique TSS
+# p05 = 7 bp = 5% of adjacent gaps are extremely close (near-duplicate TSS calls)
+# p95 = 71872 bp = 95% of adjacent gaps are < ~72 kb
+```
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(data.table)
+})
+
+# ----------------------------
+# 3) 5′-most TSS vs others (multi-TSS genes only)
+# ----------------------------
+
+# Assumes rs already exists and has at least:
+# chr, strand, txStart, txEnd, name2 (gene symbol), and tss already computed.
+# Also assumes win_start / win_end exist OR we will compute them here.
+
+flank <- 500L
+
+rs <- as.data.table(rs)
+
+# make sure strand is character (your dummy assignment style)
+. <- rs[, strand := as.character(strand)]
+
+# standardize gene column name for downstream joins
+if (!("gene" %in% names(rs))) {
+  if ("name2" %in% names(rs)) {
+    . <- setnames(rs, "name2", "gene")
+  } else {
+    stop("rs must contain either 'gene' or 'name2' column.")
+  }
+}
+
+# ensure TSS + windows exist (safe even if already present)
+if (!("tss" %in% names(rs))) stop("rs is missing 'tss' column. Compute tss first.")
+if (!all(c("win_start", "win_end") %in% names(rs))) {
+  . <- rs[, `:=`(
+    win_start = pmax(1L, as.integer(tss) - flank),
+    win_end   = as.integer(tss) + flank
+  )]
+}
+
+# ---- Focus ONLY on genes with >= 2 UNIQUE TSS ----
+tss_per_gene <- rs[, .(n_unique_tss = uniqueN(tss)), by = .(gene)]
+multi_genes  <- tss_per_gene[n_unique_tss >= 2, gene]
+
+rs_multi <- rs[gene %chin% multi_genes]
+
+# (Optional but recommended)
+# If a gene appears on multiple chromosomes/strands in annotation, overlap concept becomes weird.
+# Keep only (gene, chr, strand) groups with >=2 unique TSS.
+grp_ok <- rs_multi[, .(n_unique_tss = uniqueN(tss)), by = .(gene, chr, strand)][n_unique_tss >= 2]
+rs_multi <- rs_multi[grp_ok, on = .(gene, chr, strand)]
+
+# ---- Pick 5′-most transcript per (gene, chr, strand) ----
+# 5′-most definition:
+#   + strand: smallest genomic coordinate TSS
+#   - strand: largest genomic coordinate TSS
+rs_5p <- rs_multi[
+  , .SD[
+    if (strand[1] == "-") which.max(tss) else which.min(tss)
+  ][1],
+  by = .(gene, chr, strand)
+]
+
+. <- rs_5p[, is_5p := TRUE]
+
+# ---- Join 5′ info back to all transcripts in multi set ----
+# Now both sides have gene/chr/strand so merge is clean.
+rs2 <- merge(
+  rs_multi,
+  rs_5p[, .(gene, chr, strand,
+            tss_5p = tss,
+            win_start_5p = win_start,
+            win_end_5p   = win_end)],
+  by = c("gene", "chr", "strand"),
+  all.x = TRUE
+)
+
+# mark whether each row is the chosen 5′ transcript (by exact tss match)
+. <- rs2[, is_5p := (!is.na(tss_5p) & tss == tss_5p)]
+
+# keep only "other" transcripts (non-5′) for overlap comparison
+rs_other <- rs2[is_5p == FALSE]
+
+# ---- Compute overlap of each non-5′ window with the 5′ window ----
+# overlap length between [win_start, win_end] and [win_start_5p, win_end_5p]
+# both inclusive; window length = 2*flank + 1
+win_len <- 2L * flank + 1L
+
+rs_other[, `:=`(
+  ov_start = pmax(win_start,  win_start_5p),
+  ov_end   = pmin(win_end,    win_end_5p)
+)]
+
+rs_other[, ov_bp := pmax(0L, as.integer(ov_end - ov_start + 1L))]
+rs_other[, ov_frac := ov_bp / win_len]
+
+# ---- Summaries you’ll likely want ----
+
+# (A) How many genes/groups are we analyzing now?
+multi_summary <- list(
+  genes_total_in_rs         = uniqueN(rs$gene),
+  genes_with_multi_unique_tss = uniqueN(multi_genes),
+  gene_chr_strand_groups_multi = uniqueN(rs_multi[, paste(gene, chr, strand, sep="|")]),
+  comparisons_n_non5p_rows  = nrow(rs_other)
+)
+
+multi_summary
+
+# (B) per (gene, chr, strand): distribution of overlap fractions across "other" TSS
+overlap_by_group <- rs_other[, .(
+  n_other_tss = .N,
+  mean_ov_frac = mean(ov_frac, na.rm = TRUE),
+  median_ov_frac = median(ov_frac, na.rm = TRUE),
+  p05_ov_frac = as.numeric(quantile(ov_frac, 0.05, na.rm = TRUE)),
+  p95_ov_frac = as.numeric(quantile(ov_frac, 0.95, na.rm = TRUE))
+), by = .(gene, chr, strand)]
+
+# (C) overall overlap fraction distribution across all non-5′ transcripts
+overall_ov_stats <- rs_other[, .(
+  n = .N,
+  mean = mean(ov_frac),
+  median = median(ov_frac),
+  p05 = as.numeric(quantile(ov_frac, 0.05)),
+  p95 = as.numeric(quantile(ov_frac, 0.95))
+)]
+
+overall_ov_stats
+
+# rs_other is the long table you can histogram (ov_frac) etc.
+
+
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+})
+
+# ---- 1) Overall quantiles / summary for overlap fraction ----
+ov_summary <- rs_other[, .(
+  n = .N,
+  mean = mean(ov_frac, na.rm = TRUE),
+  median = median(ov_frac, na.rm = TRUE),
+  p05 = as.numeric(quantile(ov_frac, 0.05, na.rm = TRUE)),
+  p25 = as.numeric(quantile(ov_frac, 0.25, na.rm = TRUE)),
+  p75 = as.numeric(quantile(ov_frac, 0.75, na.rm = TRUE)),
+  p95 = as.numeric(quantile(ov_frac, 0.95, na.rm = TRUE))
+)]
+ov_summary
+
+# (optional) also summarize overlap in bp
+ov_bp_summary <- rs_other[, .(
+  n = .N,
+  mean_bp = mean(ov_bp, na.rm = TRUE),
+  median_bp = median(ov_bp, na.rm = TRUE),
+  p05_bp = as.numeric(quantile(ov_bp, 0.05, na.rm = TRUE)),
+  p25 = as.numeric(quantile(ov_bp, 0.25, na.rm = TRUE)),
+  p75 = as.numeric(quantile(ov_bp, 0.75, na.rm = TRUE)),
+  p95_bp = as.numeric(quantile(ov_bp, 0.95, na.rm = TRUE))
+)]
+ov_bp_summary
+
+
+# ---- 2) Histogram: overlap fraction between 5′ window and other windows ----
+# Because a lot of mass is at 0, a histogram is fine; optionally add a zoomed version too.
+
+p_hist_ovfrac <- ggplot(rs_other, aes(x = ov_frac)) +
+  geom_histogram(bins = 60, color = "white") +
+  theme_bw(base_size = 12) +
+  labs(
+    title = sprintf("Overlap between 5′-most TSS window and other TSS windows (±%d bp)", flank),
+    subtitle = "Each point is a non-5′ transcript within multi-TSS gene groups (gene×chr×strand)",
+    x = "Overlap fraction (intersection length / window length)",
+    y = "# transcript comparisons"
+  )
+print(p_hist_ovfrac)
+
+# ---- 3) (Optional) Zoom in on the non-zero overlaps only ----
+p_hist_nonzero <- ggplot(rs_other[ov_frac > 0], aes(x = ov_frac)) +
+  geom_histogram(bins = 60, color = "white") +
+  theme_bw(base_size = 12) +
+  labs(
+    title = sprintf("Non-zero overlaps only (±%d bp windows)", flank),
+    subtitle = "Drops the large spike at 0 to show the distribution when windows intersect",
+    x = "Overlap fraction",
+    y = "# transcript comparisons"
+  )
+print(p_hist_nonzero)
+
+# ---- 4) (Optional) Show CDF-like view via ECDF ----
+p_ecdf <- ggplot(rs_other, aes(x = ov_frac)) +
+  stat_ecdf() +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "ECDF of overlap fraction",
+    subtitle = "Useful to read off fractions below/above thresholds (e.g., overlap=0)",
+    x = "Overlap fraction",
+    y = "ECDF"
+  )
+print(p_ecdf)
+
+```
+```{r}
+library(data.table)
+
+# rs must have: chr (or chrom), strand, txStart, txEnd, name2
+# If rs already has tss, you can skip this block.
+if (!("tss" %in% names(rs))) {
+  rs <- as.data.table(rs)
+  if (!("chr" %in% names(rs))) {
+    chr_col <- names(rs)[tolower(names(rs)) %in% c("chrom", "chr")][1]
+    setnames(rs, chr_col, "chr")
+  }
+  rs[, strand := as.character(strand)]
+  rs[, tss := fifelse(strand == "-", as.integer(txEnd), as.integer(txStart) + 1L)]
+}
+```
+```{r}
+library(data.table)
+
+build_multiTSS_windows <- function(rs, genes_multi, flank = 500L) {
+  rs <- as.data.table(rs)
+
+  # keep only multi-TSS genes
+  dt <- rs[!is.na(gene) & gene %chin% genes_multi &
+             !is.na(chr) & !is.na(strand) & !is.na(tss)]
+
+  # unique TSS per gene×chr×strand (important!)
+  dt_u <- unique(dt[, .(
+    gene   = as.character(gene),
+    chr    = as.character(chr),
+    strand = as.character(strand),
+    tss    = as.integer(tss)
+  )])
+
+  # compute 5′ TSS per gene×chr×strand
+  # + strand: 5′ = smallest tss; - strand: 5′ = largest tss
+  dt_u[, tss_5p := if (strand[1] == "-") max(tss) else min(tss),
+       by = .(gene, chr, strand)]
+
+  # rank from 5′ within gene×chr×strand
+  dt_u[
+    order(gene, chr, strand, ifelse(strand == "-", -tss, tss)),
+    rank_from_5p := seq_len(.N),
+    by = .(gene, chr, strand)
+  ]
+
+  dt_u[, dist_from_5p_bp := abs(tss - tss_5p)]
+
+  # build TSS±flank window (1-based inclusive)
+  dt_u[, `:=`(
+    start = pmax(1L, tss - flank),
+    end   = tss + flank
+  )]
+
+  # unique interval name encodes gene + chr + strand + tss
+  dt_u[, name := sprintf("TSSVAR_%s_%s_%s_%d", gene, chr, strand, tss)]
+
+  # final table
+  dt_u[, .(chr, start, end, name, gene, strand, tss, tss_5p, dist_from_5p_bp, rank_from_5p)]
+}
+
+# build windows
+# if you want to keep the name you were using:
+genes_with_multi_unique_tss <- multi_genes
+
+# now call with the correct object
+
+flank <- 500L
+tssvar_iv <- build_multiTSS_windows(rs, genes_with_multi_unique_tss, flank = flank)
+setkey(tssvar_iv, chr, start, end)
+
+tssvar_iv[, .N]
+tssvar_iv[, uniqueN(gene)]
+```
+
+```{r}
+library(data.table)
+
+tss_lookup <- as.data.table(tssvar_iv)[
+  , .(name, gene, dist_from_5p_bp, rank_from_5p)
+]
+setkey(tss_lookup, name)
+
+```
+
+```{r}
+library(data.table)
+
+
+pwd_for_pair_gene_agg_stream <- function(bedA, bedB, intervals_dt, lookup_dt,
+                                         min_cov = 8L, min_cpgs = 1L,
+                                         interval_chunk = 5000L,
+                                         pair_label = "PAIR",
+                                         sampleA = "A", sampleB = "B") {
+  stopifnot(all(c("chr","start","end","name") %in% names(intervals_dt)))
+  stopifnot("name" %in% names(lookup_dt))
+
+  # ensure lookup has what we need
+  need_lookup <- c("name","gene","dist_from_5p_bp","rank_from_5p")
+  miss_lookup <- setdiff(need_lookup, names(lookup_dt))
+  if (length(miss_lookup)) {
+    stop("lookup_dt missing columns: ", paste(miss_lookup, collapse = ", "))
+  }
+
+  # copy + key lookup for fast merge
+  lookup <- data.table::as.data.table(lookup_dt)[, ..need_lookup]
+  data.table::setkey(lookup, name)
+
+  iv <- data.table::as.data.table(intervals_dt)[, .(chr, start, end, name)]
+  iv[, `:=`(chr = as.character(chr),
+            start = as.integer(start),
+            end   = as.integer(end),
+            name  = as.character(name))]
+
+  # chunk indices
+  n <- nrow(iv)
+  idx_chunks <- split(seq_len(n), ceiling(seq_len(n) / interval_chunk))
+
+  # accumulator (small!)
+  acc <- data.table(
+    pair = character(),
+    sampleA = character(),
+    sampleB = character(),
+    gene = character(),
+    dist_from_5p_bp = integer(),
+    rank_from_5p = integer(),
+    sum_w = numeric(),        # sum(pwd_mean * n_cpg)
+    sum_cpg = numeric(),      # sum(n_cpg)
+    n_intervals = integer()
+  )
+  data.table::setkey(acc, pair, gene, dist_from_5p_bp, rank_from_5p)
+
+  for (ii in seq_along(idx_chunks)) {
+    idx <- idx_chunks[[ii]]
+    iv_chunk <- iv[idx]
+
+    # core computation: returns per-interval name + pwd_mean + n_cpg
+    tbl <- pwd_for_pair_chunked(
+      bedA, bedB, iv_chunk,
+      min_cov = min_cov,
+      min_cpgs = min_cpgs,
+      interval_chunk = interval_chunk
+    )
+    if (!nrow(tbl)) { gc(); next }
+
+    tbl <- data.table::as.data.table(tbl)[, .(name, pwd_mean, n_cpg)]
+    tbl[, name := as.character(name)]
+    data.table::setkey(tbl, name)
+
+    # IMPORTANT FIX: inner join via merge (safe + deterministic)
+    # keep only names that exist in lookup
+    tbl2 <- merge(tbl, lookup, by = "name", all = FALSE)
+    if (!nrow(tbl2)) { rm(tbl); gc(); next }
+
+    # chunk aggregation to small table
+    chunk_agg <- tbl2[, .(
+      sum_w       = sum(pwd_mean * pmax(n_cpg, 1L), na.rm = TRUE),
+      sum_cpg     = sum(pmax(n_cpg, 1L), na.rm = TRUE),
+      n_intervals = .N
+    ), by = .(gene, dist_from_5p_bp, rank_from_5p)]
+
+    chunk_agg[, `:=`(pair = pair_label, sampleA = sampleA, sampleB = sampleB)]
+    data.table::setkey(chunk_agg, pair, gene, dist_from_5p_bp, rank_from_5p)
+
+    # add into accumulator
+    acc <- merge(
+      acc, chunk_agg,
+      by = c("pair","gene","dist_from_5p_bp","rank_from_5p"),
+      all = TRUE,
+      suffixes = c("", ".i")
+    )
+
+    # coalesce + sum
+    acc[, `:=`(
+      sum_w       = fifelse(is.na(sum_w), 0, sum_w) + fifelse(is.na(sum_w.i), 0, sum_w.i),
+      sum_cpg     = fifelse(is.na(sum_cpg), 0, sum_cpg) + fifelse(is.na(sum_cpg.i), 0, sum_cpg.i),
+      n_intervals = fifelse(is.na(n_intervals), 0L, n_intervals) + fifelse(is.na(n_intervals.i), 0L, n_intervals.i),
+      sampleA     = fifelse(is.na(sampleA), sampleA.i, sampleA),
+      sampleB     = fifelse(is.na(sampleB), sampleB.i, sampleB)
+    )]
+
+    # drop merge temp cols
+    acc[, c("sum_w.i","sum_cpg.i","n_intervals.i","sampleA.i","sampleB.i") := NULL]
+
+    rm(tbl, tbl2, chunk_agg, iv_chunk)
+    gc()
+  }
+
+  # finalize CpG-weighted mean PWD
+  acc[, wmean_pwd := fifelse(sum_cpg > 0, sum_w / sum_cpg, NA_real_)]
+  acc[]
+}
+STD_CHR <- c(paste0("chr", 1:22), "chrX", "chrY")
+
+read_cpg_bed_dt <- function(path, min_cov = 8L) {
+  dt <- fread(path, sep = "\t", header = FALSE,
+              col.names = c("chr","start","end","beta","cov","meth","unmeth"),
+              showProgress = FALSE)
+  dt <- dt[chr %chin% STD_CHR]
+  dt <- dt[!is.na(beta) & !is.na(cov) & cov >= min_cov,
+           .(chr = as.character(chr),
+             start = as.integer(start),      # 0-based CpG start
+             beta = as.numeric(beta))]
+  dt[, pos := start + 1L]  # convert to 1-based coordinate for overlap
+  dt
+}
+
+pwd_for_pair_chunked <- function(pathA, pathB, intervals_dt,
+                                 min_cov = 8L, min_cpgs = 1L,
+                                 interval_chunk = 5000L) {
+
+  A <- read_cpg_bed_dt(pathA, min_cov)
+  B <- read_cpg_bed_dt(pathB, min_cov)
+
+  # CpG-level inner join (shared CpGs)
+  setkey(A, chr, start)
+  setkey(B, chr, start)
+  AB <- B[A, nomatch = 0L]     # i.* from B, plain cols from A
+
+  if (!nrow(AB)) {
+    return(data.table(name=character(), gene=character(),
+                      pwd_mean=numeric(), n_cpg=integer()))
+  }
+
+  AB[, pwd := abs(beta - i.beta)]
+
+  # points for foverlaps: start=end=pos
+  AB_pts <- AB[, .(chr,
+                   start = as.integer(pos),
+                   end   = as.integer(pos),
+                   pwd)]
+  setkey(AB_pts, chr, start, end)
+
+  # ensure intervals are keyed correctly
+  iv <- as.data.table(intervals_dt)
+  stopifnot(all(c("chr","start","end","name") %in% names(iv)))
+  if (!("gene" %in% names(iv))) iv[, gene := NA_character_]
+  iv[, `:=`(chr = as.character(chr),
+            start = as.integer(start),
+            end   = as.integer(end))]
+  setkey(iv, chr, start, end)
+
+  chrs <- intersect(unique(AB_pts$chr), unique(iv$chr))
+  out_chr <- vector("list", length(chrs))
+
+  for (ci in seq_along(chrs)) {
+    ch <- chrs[ci]
+    cpg_ch <- AB_pts[chr == ch]
+    iv_ch  <- iv[chr == ch]
+    if (!nrow(cpg_ch) || !nrow(iv_ch)) next
+
+    # chunk intervals
+    idx <- split(seq_len(nrow(iv_ch)),
+                 ceiling(seq_len(nrow(iv_ch)) / interval_chunk))
+
+    out_chunks <- vector("list", length(idx))
+    for (k in seq_along(idx)) {
+      iv_chunk <- iv_ch[idx[[k]], .(chr, start, end, name, gene)]
+      setkey(iv_chunk, chr, start, end)
+
+      j <- foverlaps(cpg_ch, iv_chunk, nomatch = 0L)
+      if (!nrow(j)) next
+
+      out_chunks[[k]] <- j[, .(
+        pwd_mean = mean(pwd, na.rm = TRUE),
+        n_cpg    = .N
+      ), by = .(name, gene)]
+    }
+
+    out_chr[[ci]] <- rbindlist(out_chunks, use.names = TRUE, fill = TRUE)
+    gc()
+  }
+
+  res <- rbindlist(out_chr, use.names = TRUE, fill = TRUE)
+  if (!nrow(res)) return(res)
+
+  res <- res[n_cpg >= min_cpgs]
+  unique(res)
+}
+
+# ---- BED file paths (WGBS CpG BEDs) ----
+bed_dir <- "data"
+
+bed_paths <- c(
+  EN = file.path(bed_dir, "EN.bed"),
+  IN = file.path(bed_dir, "IN.bed"),
+  JN = file.path(bed_dir, "JN.bed")
+)
+
+min_cov  <- 5L   # or 8L, whatever you want
+min_cpgs <- 1L
+```
+
+```{r}
+
+# Normal-only pairs
+pairs_normal <- pairs[names(pairs) %chin% c("Normal EN–IN", "Normal EN–JN", "Normal IN–JN")]
+
+# Use only needed columns for intervals
+tssvar_iv_small <- as.data.table(tssvar_iv)[, .(chr, start, end, name)]
+setkey(tssvar_iv_small, chr, start, end)
+
+pwd_tssvar_gene_by_pair <- rbindlist(lapply(names(pairs_normal), function(pnm) {
+  s1 <- pairs_normal[[pnm]][1]
+  s2 <- pairs_normal[[pnm]][2]
+  message("Running pair: ", pnm, " (", s1, " vs ", s2, ")")
+
+  pwd_for_pair_gene_agg_stream(
+    bedA = bed_paths[[s1]],
+    bedB = bed_paths[[s2]],
+    intervals_dt = tssvar_iv_small,
+    lookup_dt = tss_lookup,
+    min_cov = min_cov,
+    min_cpgs = min_cpgs,
+    interval_chunk = 1000L,      # you can tune this
+    pair_label = pnm,
+    sampleA = s1, sampleB = s2
+  )
+}), use.names = TRUE, fill = TRUE)
+```
+```{r}
+# Average across the 3 normal pairs (simple mean across pairs)
+pwd_tssvar_gene_avg <- pwd_tssvar_gene_by_pair[
+  , .(
+    mean_pwd_3pairs = mean(wmean_pwd, na.rm = TRUE),
+    median_pwd_3pairs = median(wmean_pwd, na.rm = TRUE),
+    n_pairs = uniqueN(pair),
+    total_cpg = sum(sum_cpg, na.rm = TRUE),
+    total_intervals = sum(n_intervals, na.rm = TRUE)
+  ),
+  by = .(gene, dist_from_5p_bp, rank_from_5p)
+]
+```
+
+
+
+```{r}
+library(ggplot2)
+library(data.table)
+# Ensure mgcv is installed
+if (!requireNamespace("mgcv", quietly = TRUE)) install.packages("mgcv")
+
+# (A) Revised Distance Plot with GAM
+p_dist <- ggplot(dt_plot, aes(x = dist_from_5p_bp, y = mean_pwd_3pairs)) +
+  geom_point(alpha = 0.15, size = 0.6) +
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), se = TRUE) + # Much faster for large n
+  scale_x_continuous(trans = "log1p") +
+  theme_bw(base_size = 12)
+
+dt_plot <- as.data.table(pwd_tssvar_gene_avg)
+
+# (A) PWD vs distance (bp) from 5′ most TSS
+p_dist <- ggplot(dt_plot, aes(x = dist_from_5p_bp, y = mean_pwd_3pairs)) +
+  geom_point(alpha = 0.15, size = 0.6) +
+  geom_smooth(method = "loess", se = FALSE) + # se = FALSE fixes the memory error
+  scale_x_continuous(trans = "log1p") +
+  theme_bw(base_size = 12) +
+  labs(title = "Multi-TSS genes: methylation divergence vs distance", 
+       x = "Distance (log1p)", y = "Mean PWD")
+
+p_dist2 <- ggplot(dt_plot, aes(x = dist_from_5p_bp, y = mean_pwd_3pairs)) +
+  geom_point(alpha = 0.15, size = 0.6) +
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), se = TRUE) + # Much faster for large n
+  scale_x_continuous(trans = "log1p") +
+  theme_bw(base_size = 12)
+
+print(p_dist)
+print(p_dist2)
+
+# (B) PWD vs rank from 5′ (1 = 5′ most)
+p_rank <- ggplot(dt_plot, aes(x = rank_from_5p, y = mean_pwd_3pairs)) +
+  geom_point(alpha = 0.15, size = 0.6) +
+  geom_smooth(method = "loess", se = TRUE, color = "red",size=1) +
+  geom_quantile(quantiles = 0.5, color = "blue", size = 1) +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Multi-TSS genes: methylation divergence vs TSS rank from 5′",
+    subtitle = "Rank computed within gene×chr×strand; PWD averaged across 3 Normal pairs",
+    x = "TSS rank from 5′ (1 = 5′ most)",
+    y = "Mean PWD across 3 Normal pairs (CpG-weighted within window)"
+  )
+print(p_rank)
+```
+```{r}
+library(data.table)
+
+# tssvar_iv has one row per unique TSS window (gene×chr×strand×tss)
+# If you want per gene overall (across chr/strand), do:
+tss_per_gene <- tssvar_iv[, .(n_unique_tss = uniqueN(tss)), by = gene]
+
+# distribution
+dist_tbl <- tss_per_gene[, .N, by = n_unique_tss][order(n_unique_tss)]
+dist_tbl
+
+# quick summary stats
+tss_per_gene_summary <- tss_per_gene[, .(
+  n_genes = .N,
+  mean_tss = mean(n_unique_tss),
+  median_tss = median(n_unique_tss),
+  p90 = as.numeric(quantile(n_unique_tss, 0.90)),
+  p95 = as.numeric(quantile(n_unique_tss, 0.95)),
+  max_tss = max(n_unique_tss)
+)]
+tss_per_gene_summary
+```
+```{r}
+tss_per_group <- tssvar_iv[, .(n_unique_tss = uniqueN(tss)), by = .(gene, chr, strand)]
+dist_group_tbl <- tss_per_group[, .N, by = n_unique_tss][order(n_unique_tss)]
+dist_group_tbl
+```
+
+```{r}
+library(data.table)
+library(ggplot2)
+
+dt_plot <- as.data.table(pwd_tssvar_gene_avg)
+
+# guard against duplicated quantile breakpoints (happens if many dist=0)
+qbreaks <- unique(as.numeric(quantile(dt_plot$dist_from_5p_bp,
+                                     probs = seq(0, 1, 0.1),
+                                     na.rm = TRUE)))
+# if breaks collapse too much, fall back to fixed bins
+if (length(qbreaks) < 3) {
+  qbreaks <- c(-Inf, 0, 10, 100, 1e3, 1e4, 1e5, Inf)
+}
+
+dt_plot[, dist_bin := cut(dist_from_5p_bp, breaks = qbreaks, include.lowest = TRUE)]
+
+bin_sum <- dt_plot[, .(
+  n         = .N,
+  mean_pwd  = mean(mean_pwd_3pairs, na.rm = TRUE),
+  median_pwd= median(mean_pwd_3pairs, na.rm = TRUE)
+), by = dist_bin][order(dist_bin)]
+
+ggplot(bin_sum, aes(x = dist_bin, y = mean_pwd, group = 1)) +
+  geom_line() +
+  geom_point() +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title = "Binned trend: mean PWD vs distance-from-5′",
+    subtitle = "Bins are distance quantiles (fallback to fixed bins if needed)",
+    x = "Distance-from-5′ bins",
+    y = "Mean PWD across 3 Normal pairs"
+  )
+```
+```{r}
+library(ggplot2)
+library(data.table)
+
+# 1. Create a grouping column for 5' status
+dt_density <- as.data.table(pwd_tssvar_gene_avg)
+dt_density[, tss_group := fifelse(rank_from_5p == 1, "5' Most (Rank 1)", "Non-5' Most (Rank > 1)")]
+
+# 2. Generate the density plot
+p_density <- ggplot(dt_density, aes(x = mean_pwd_3pairs, fill = tss_group)) +
+  geom_density(alpha = 0.4) +
+  theme_bw(base_size = 12) +
+  scale_fill_manual(values = c("5' Most (Rank 1)" = "#2c7bb6", 
+                               "Non-5' Most (Rank > 1)" = "#d7191c")) +
+  labs(
+    title = "Distribution of Methylation Divergence (PWD)",
+    subtitle = "Comparing 5'-most TSS vs. downstream TSS across 3 Normal pairs",
+    x = "Mean PWD (CpG-weighted)",
+    y = "Density",
+    fill = "TSS Position"
+  ) +
+  # Optional: Zoom in on the x-axis if there are long tails
+  coord_cartesian(xlim = c(0, quantile(dt_density$mean_pwd_3pairs, 0.99, na.rm = TRUE)))
+
+print(p_density)
+```
+```{r}
+library(data.table)
+
+# 1. Identify the TSS with the minimum PWD for each gene
+# We only consider genes that actually have more than 1 TSS
+gene_min_pwd <- dt_plot[, .(
+    min_pwd_rank = rank_from_5p[which.min(mean_pwd_3pairs)],
+    n_tss = .N
+), by = gene][n_tss > 1]
+
+# 2. Calculate the fraction where Rank 1 is NOT the minimum
+is_not_lowest_count <- sum(gene_min_pwd$min_pwd_rank != 1)
+total_multi_tss_genes <- nrow(gene_min_pwd)
+fraction_not_lowest <- is_not_lowest_count / total_multi_tss_genes
+
+# 3. Print the results
+cat(sprintf("Total multi-TSS genes: %d\n", total_multi_tss_genes))
+cat(sprintf("Genes where 5' (Rank 1) is NOT the lowest PWD: %d\n", is_not_lowest_count))
+cat(sprintf("Fraction: %.2f%%\n", fraction_not_lowest * 100))
+
+# Optional: View the distribution of which ranks actually ARE the lowest
+table(gene_min_pwd$min_pwd_rank)
+```
+```{r}
+library(ggplot2)
+library(data.table)
+
+# Calculate Delta: (PWD of 5'-most TSS) - (Min PWD found in that gene)
+# Positive values indicate the 5'-most TSS is NOT the lowest PWD, 
+# and the value represents how much higher the divergence is compared to the true minimum.
+gene_comparison <- dt_plot[, .(
+  pwd_rank1 = mean_pwd_3pairs[rank_from_5p == 1],
+  pwd_min = min(mean_pwd_3pairs),
+  min_rank = rank_from_5p[which.min(mean_pwd_3pairs)]
+), by = gene][!is.na(pwd_rank1)]
+
+gene_comparison[, delta_pwd := pwd_rank1 - pwd_min]
+
+# Sensitivity Plot: Distribution of Delta PWD for genes where 5' is NOT the lowest
+p_sensitivity <- ggplot(gene_comparison[delta_pwd > 0], aes(x = delta_pwd)) +
+  geom_histogram(bins = 50, fill = "firebrick", alpha = 0.7) +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Sensitivity of 5′-most TSS choice (Delta PWD)",
+    subtitle = "PWD(5′-most) - PWD(True Min) for genes where 5′ is not the lowest",
+    x = "Delta PWD (Difference in divergence)",
+    y = "Count of Genes"
+  )
+print(p_sensitivity)
+```
+```{r}
+library(MASS)
+
+# Perform Spearman Correlation (Robust to non-linear/outlier data)
+cor_test <- cor.test(dt_plot$rank_from_5p, dt_plot$mean_pwd_3pairs, method = "spearman")
+
+cat(sprintf("Spearman Correlation (Rho): %.4f\n", cor_test$estimate))
+cat(sprintf("P-value: %.2e\n", cor_test$p.value))
+
+# Robust Scatterplot
+# Note: method="rlm" requires the MASS package
+if (!requireNamespace("MASS", quietly = TRUE)) install.packages("MASS")
+
+p_corr <- ggplot(dt_plot, aes(x = rank_from_5p, y = mean_pwd_3pairs)) +
+  geom_point(alpha = 0.1, size = 0.5) +
+  geom_smooth(method = "rlm", color = "darkgreen", se = TRUE) +
+  geom_quantile(quantiles = 0.5, color = "blue", size = 1) +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Robust trend of PWD vs TSS Rank",
+    subtitle = paste0("Spearman Rho = ", round(cor_test$estimate, 3)),
+    x = "TSS Rank from 5' (1 = 5' most)",
+    y = "Mean PWD across 3 Normal pairs"
+  )
+print(p_corr)
+```
+
