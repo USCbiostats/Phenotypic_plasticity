@@ -6,222 +6,138 @@ The core scientific question is:
 
 > Do genes that are more *expression‑plastic* across epithelial cell types show **more conserved** or **more divergent** DNA methylation in promoters and enhancers?
 
-The repository is organized around a **single main analysis notebook**, supported by several **mapping, preprocessing, and quality‑control Rmd files**. This README explains the role of each file and how they fit together.
-
 ---
 
 ## 🧠 Conceptual Overview
 
 ### Expression (Plasticity Proxy)
 
-* Data sources: **SCP259** (normal vs inflamed colon) and **SCP1162** (normal vs tumor; MMRd/MMRp)
-* Epithelial cells only
-* Pipeline:
-
-  1. Collapse transcript‑level rows → **gene‑level counts**
-  2. Per‑cell normalization: **CP10k**
-  3. Log transform: **log2(CP10k + 1)**
-  4. Average within epithelial **cell types**
-  5. For each gene:
-
-     * `mean_expr`: mean across epithelial cell types
-     * `var_expr`: variance across epithelial cell types (plasticity proxy)
+* **Data sources:**
+    * **SCP259:** Normal vs. Inflamed (UC) colon (Epithelial cells only).
+    * **SCP1162:** Normal vs. Tumor (MMRd & MMRp) (Epithelial cells only).
+* **Pipeline:**
+    1.  Collapse transcript‑level rows → **gene‑level counts** (summation).
+    2.  Per‑cell normalization: **CP10k** (Counts Per 10k).
+    3.  Log transform: **log2(CP10k + 1)**.
+    4.  Average within epithelial **cell types**.
+    5.  **Metrics per gene:**
+        * `mean_expr`: Mean expression across epithelial cell types.
+        * `var_expr`: Variance across epithelial cell types (**Plasticity Proxy**).
 
 ### Methylation (PWD)
 
-* Data source: Whole‑genome bisulfite sequencing (WGBS)
-
-* Metric: **Pairwise methylation divergence (PWD)**
-
-* Interval‑level PWD is precomputed elsewhere and imported here
-
-* Regulatory contexts:
-
-  * **pELS** (proximal enhancers)
-  * **dELS** (distal enhancers)
-  * **TSS500** (±500 bp around 5′‑most TSS per gene)
-
-* Gene‑level PWD is computed as:
-
-```
-wmean_pwd = weighted.mean(pwd_mean, w = n_cpg)
-```
-
-* Enhancers are assigned to genes via **nearest 5′‑most TSS**
+* **Data source:** Whole‑genome bisulfite sequencing (WGBS).
+* **Metric:** **Pairwise Methylation Divergence (PWD)**.
+* **Regulatory Contexts:**
+    * **TSS500:** ±500 bp around the **5′‑most TSS** per gene.
+    * **pELS:** Proximal Enhancer-Like Signatures (mapped to nearest gene).
+    * **dELS:** Distal Enhancer-Like Signatures (mapped to nearest gene).
+* **Aggregation:** Interval‑level PWD is aggregated to the gene level using a **CpG‑weighted mean**.
 
 ---
 
-## ⭐ Main Analysis File (Start Here)
+## 🏗️ 1. Master Data Generation (Upstream)
 
-### **`Expression_Phenotypic.Rmd`**
-
-🚨 **This is the main analysis notebook for the project.**
-
-This file integrates **gene‑level expression plasticity** and **gene‑level methylation divergence** and produces all primary results and figures.
-
-**What this file does:**
-
-1. **Processes single‑cell RNA‑seq data**
-
-   * SCP259 and SCP1162 (epithelial only)
-   * Gene‑level expression matrices per epithelial cell type
-   * Computes `mean_expr` and `var_expr`
-
-2. **Imports gene‑level PWD tables**
-
-   * From pELS, dELS, and TSS500
-   * Uses weighted mean PWD per gene per sample pair
-
-3. **Merges expression and methylation at the gene level**
-
-   * Ensures consistent gene identifiers
-   * Keeps joins explicit and reproducible
-
-4. **Generates figures**
-
-   * `mean_expr` vs `wmean_pwd`
-   * `var_expr` vs `wmean_pwd`
-   * Stratified by:
-
-     * Regulatory feature (pELS / dELS / TSS500)
-     * Sample‑pair category (e.g. Normal pairs)
-
-5. **Creates summary tables**
-
-   * Top genes by expression
-   * Top genes by expression variance
-   * Genes with highest / lowest methylation divergence
-
-👉 **If you want the biological results, this is the file to read and run.**
-
----
-
-## 🧬 Gene & Interval Mapping Files
-
-These files define how transcripts, genes, TSSs, and intervals are mapped. They are critical for correctness but are not meant to be run repeatedly once validated.
+This script must be run **first**. It generates the foundational data structures (gene models, intervals, and PWD tables) used by all downstream analysis scripts.
 
 ### `Refseq_master.Rmd`
 
-🚨 **Master Data Generation Pipeline**
+🚨 **Master Pipeline: Intervals & Methylation**
 
-This is the consolidated upstream script that generates the fundamental data structures for the project. It supersedes older mapping scripts by standardizing the **5'–most** rule across all genomic contexts.
-
-* **Builds `refseq_all`:** Downloads and merges UCSC RefSeq and KnownGene tables into a single master annotation.
+* **Builds `refseq_all`:** Consolidates UCSC RefSeq and KnownGene tables into a single master annotation.
 * **Enforces 5'–Most Rule:** Rigorously selects the single 5'–most transcript per gene (strand–aware) to define the canonical gene start.
-* **Defines Intervals:** Generates coordinates for:
-    * **Promoters:** `TSS500`, `TSS1000`
-    * **Gene Bodies:** `TxBody`, `CDS`
-    * **Regulatory Features:** `pELS`, `dELS`, `CGI`, `TF_peaks` (mapped to the nearest gene)
+* **Defines Intervals:** Generates coordinates for Promoters (`TSS500`), Gene Bodies (`TxBody`, `CDS`), and regulatory features (`pELS`, `dELS`, `CGI`, `TF_peaks`) mapped to the nearest gene.
 * **Calculates PWD:** Runs the memory–efficient, chunked PWD calculation engine for **all** defined intervals and sample pairs.
 
-**Output:** Saves RDS files (e.g., `pwd_TSS500.rds`, `pwd_pELS.rds`) to the `/data` folder for downstream analysis.
-
-### `TSS_gene_mapping.Rmd`
-
-Defines the **gene‑level TSS representation** used throughout the project.
-
-* Uses RefSeq annotations (`refseq_all`)
-* Selects the **5′‑most TSS per gene** (strand‑aware)
-* Builds **TSS500 windows**: `[TSS − 500, TSS + 500]`
-* Output is used for:
-
-  * Promoter‑level PWD (TSS500)
-  * Enhancer → gene assignment
-
-This file encodes a **key methodological assumption** of the project.
+**Output:** Saves gene-level RDS files (e.g., `pwd_TSS500.rds`, `pwd_pELS.rds`) to the `/data` folder.
 
 ---
 
-### `Refseq_PWD.Rmd`
+## 📊 2. Main Analysis Scripts (Downstream)
 
-Handles **gene‑level methylation divergence calculation** from interval‑level PWD.
+These scripts consume the PWD files generated above and integrate them with single-cell expression data to produce the final figures.
 
-* Inputs:
+### `SCP259_Analysis.Rmd`
 
-  * Interval‑level PWD tables (from `run_all_pairs_one_interval_dt`)
-  * Interval annotations (pELS / dELS / TSS500)
-* Steps:
+**Dataset:** Normal Colon vs. Ulcerative Colitis (UC).
 
-  * Assign intervals to genes (directly for TSS500; nearest TSS for enhancers)
-  * Collapse interval‑level PWD → **gene‑level weighted mean PWD**
+* **Expression Processing:**
+    * Loads raw SCP259 matrices.
+    * Computes `mean` and `variance` of expression for **Healthy** and **UC** epithelial cells.
+* **Integration:** Merges expression stats with `pwd_TSS500`, `pwd_pELS`, and `pwd_dELS`.
+* **Visualization:** Generates scatter plots of **Methylation Divergence (X)** vs. **Expression Plasticity (Y)**.
+* **Output:** Summary tables and plots for Healthy/UC conditions.
 
-This file produces the **gene‑level PWD tables** consumed by `Expression_Phenotypic.Rmd`.
+### `SCP1162_Analysis.Rmd`
 
----
+**Dataset:** Normal Colon vs. Colorectal Cancer (MMRd & MMRp).
 
-## 🔁 Transcript / Gene ID Mapping (Support Files)
-
-These files were created to **resolve transcript‑to‑gene mapping issues** and to validate consistency across annotation systems. They are mainly for transparency and reproducibility.
-
-### `ENST_mapping_Ensembl.Rmd`
-
-* Maps Ensembl transcript IDs (ENST) → gene identifiers
-* Used to understand transcript duplication and gene collapsing
-* Informs how expression matrices are summed at the gene level
+* **Robust ID Mapping:** Implements advanced logic to clean and map messy gene IDs (e.g., `ENSG..._Symbol`, version numbers) to valid HGNC symbols.
+* **Expression Processing:** Uses **BPCells** for memory-efficient processing of the large SCP1162 dataset.
+* **Grouping:** Separately processes **Normal**, **Tumor_MMRd**, and **Tumor_MMRp** epithelial populations.
+* **Visualization:** Compares plasticity vs. conservation across normal and tumor states.
 
 ---
 
-### `ENST_mapping_UCSC.Rmd`
-
-* Alternative transcript‑to‑gene mapping using UCSC / RefSeq‑style annotations
-* Cross‑checks consistency with Ensembl mappings
-
----
-
-### `ENST_data_check.Rmd`
-
-**Quality‑control notebook**
-
-* Diagnoses:
-
-  * Duplicate transcripts
-  * One‑to‑many transcript–gene mappings
-  * Potential gene inflation or loss
-
-This file does **not** generate final analysis outputs, but documents decisions made upstream.
+## ✅ 3. Validation & Quality Control
 
 ### `5prime_validation.Rmd`
 
 **Methodological Validation: Why the 5'–most TSS?**
 
-This notebook scientifically validates the decision to use the 5'–most TSS as the representative promoter for a gene, rather than alternative downstream TSSs.
+* **Goal:** Scientifically validates the decision to use the 5'–most TSS as the representative promoter.
+* **Analysis:**
+    * Identifies genes with multiple unique TSSs.
+    * Compares PWD of the 5'–most TSS against alternative downstream TSSs.
+    * **Key Insight:** Demonstrates that phenotypic plasticity signals are best captured by the canonical 5' start site.
 
-* **Multi–TSS Analysis:** Identifies genes with multiple unique transcription start sites.
-* **Divergence Comparison:** Compares the methylation divergence (PWD) of the 5'–most TSS against downstream alternative TSSs.
-* **Sensitivity Metrics:**
-    * **Distance Decay:** Plots PWD as a function of distance from the 5' end.
-    * **Rank Correlation:** Checks if the 5'–most TSS consistently captures the lowest (or most representative) divergence.
-    * **Delta PWD:** Quantifies the error margin when the 5'–most TSS is *not* the most conserved site.
+### `ENST_data_check.Rmd`
 
-**Key Insight:** Provides statistical justification that phenotypic plasticity is best captured by the canonical 5' start site, with 7% error rate.
+**Data Quality Control**
 
----
-
-## 🧪 Which Files Matter for What?
-
-| Goal                        | File(s)                     |
-| --------------------------- | --------------------------- |
-| Main biological results     | `Expression_Phenotypic.Rmd` |
-| Gene‑level PWD construction | `Refseq_PWD.Rmd`            |
-| TSS definition              | `TSS_gene_mapping.Rmd`      |
-| Transcript ↔ gene mapping   | `ENST_mapping_*.Rmd`        |
-| Data QC / validation        | `ENST_data_check.Rmd`       |
+* Diagnoses duplicate transcripts and one‑to‑many mappings.
+* Documents decisions made regarding gene ID collapsing and filtering.
 
 ---
 
-## 📌 Reproducibility Notes
+## 📦 4. Supportive, Legacy, & Reference Modules
 
-* All joins are performed at the **gene level** using consistent identifiers
-* Enhancer–gene assignment uses **nearest 5′‑most TSS**, not overlap
-* Gene‑level PWD uses **CpG‑weighted means**
-* Expression plasticity is defined as **variance across epithelial cell types**, not across cells
+These files are retained for reproducibility and transparency. While their core logic has been integrated into the **Master Data Generation** pipeline, they serve as independent references for specific methodological steps.
+
+### `TSS_gene_mapping.Rmd`
+**Legacy Module: TSS Definition**
+* Defines the logic for selecting the **5′‑most TSS per gene** (strand‑aware) and building promoter windows.
+* **Status:** Its logic is now fully incorporated into `Refseq_master.Rmd`. Retained as a standalone record of the interval definition strategy.
+
+### `Refseq_PWD.Rmd`
+**Legacy Module: Methylation Calculation**
+* Contains the original standalone code for calculating PWD from interval tables.
+* **Status:** The PWD calculation engine has been optimized and moved to `Refseq_master.Rmd`. This file is useful for auditing the math behind the divergence metric.
+
+### `ENST_mapping_Ensembl.Rmd` & `ENST_mapping_UCSC.Rmd`
+**Exploratory Notebooks: ID Resolution**
+* These scripts explore the complex mapping between Ensembl transcript IDs (ENST) and gene symbols.
+* **Status:** They document the rationale behind the final ID selection strategy used to merge the Single-Cell (Expression) and WGBS (Methylation) datasets.
 
 ---
 
-## 🧬 Final Note
+## 📂 File Dependency Graph
 
-If you are new to this repository:
+```mermaid
+graph TD
+    A[Refseq_master.Rmd] -->|Generates| B(data/refseq_all.rds)
+    A -->|Generates| C(data/pwd_*.rds)
+    
+    C --> D[SCP259_Analysis.Rmd]
+    C --> E[SCP1162_Analysis.Rmd]
+    
+    B --> F[5prime_validation.Rmd]
+    
+    subgraph "Reference / Legacy"
+    G[TSS_gene_mapping.Rmd]
+    H[Refseq_PWD.Rmd]
+    I[ENST_mapping_*.Rmd]
+    end
+```
 
-➡️ **Start with `Expression_Phenotypic.Rmd`**
 
-All other files exist to support, justify, or validate the assumptions used there.

@@ -1,0 +1,412 @@
+---
+title: "SCP1162_Analysis"
+output: html_document
+date: "2026-03-03"
+---
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+  library(BPCells)
+  library(data.table)
+  library(Matrix)
+  library(ggplot2)
+  library(ggrepel)
+  library(dplyr)
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+  library(biomaRt)
+})
+
+# --- Configuration ---
+DATA_DIR <- "data"
+SCP1162_DIR <- file.path(DATA_DIR, "SCP1162")
+
+# Check if directories exist
+if (!dir.exists(SCP1162_DIR)) stop("SCP1162 directory not found.")
+```
+
+## Robust ID Mapping & Helper Functions
+
+```{r}
+# ==============================================================================
+# 2. Robust ID Mapping & Helper Functions
+# ==============================================================================
+
+## --- Helper: Load Valid Gene Symbols for Validation ---
+# We need a reference set of "real" symbols to mine the messy labels
+get_valid_symbols <- function() {
+  keys(org.Hs.eg.db, keytype = "SYMBOL")
+}
+
+## --- Helper: Extract Gene Symbol from Composite Strings ---
+# Turns "Epi_39_SEPP1_SLC26A3_EpiN8" -> "SEPP1"
+extract_valid_symbol_from_tokens <- function(messy_ids, valid_set) {
+  # Split by any non-alphanumeric character (underscore, dot, dash)
+  # But keep dashes inside symbols (rare but exist)
+  tokens_list <- strsplit(messy_ids, "[^A-Za-z0-9-]+")
+  
+  cleaned <- vapply(tokens_list, function(tokens) {
+    # 1. Filter out common garbage tokens
+    candidates <- tokens[!grepl("^(Epi|Strom|B|T|Myeloid|Mast|Plasma|Cl|cluster|nd|[0-9]+)$", tokens, ignore.case=TRUE)]
+    
+    # 2. Check overlap with valid symbols
+    hits <- intersect(candidates, valid_set)
+    
+    # 3. Return the first valid hit, or NA
+    if (length(hits) > 0) return(hits[1]) 
+    return(NA_character_)
+  }, character(1))
+  
+  return(cleaned)
+}
+
+## --- Main Mapping Function ---
+map_ids_to_symbol_robust <- function(ids, try_biomart = TRUE) {
+  ids <- unique(ids[!is.na(ids) & ids != ""])
+  map_res <- data.table(original_id = ids, hgnc_symbol = NA_character_)
+  
+  # Load reference set
+  valid_symbols <- get_valid_symbols()
+  
+  # ---------------------------------------------------------
+  # Strategy 1: Clean ENSG IDs (e.g., ENSG00000238009.6_5 -> ENSG00000238009)
+  # ---------------------------------------------------------
+  is_ensg <- grepl("^ENSG[0-9]+", ids)
+  if (any(is_ensg)) {
+    # Strip everything starting from the first period
+    clean_ensg <- sub("\\..*$", "", ids[is_ensg])
+    
+    suppressMessages({
+      loc_ens <- tryCatch(
+        mapIds(org.Hs.eg.db, keys = unique(clean_ensg), column = "SYMBOL", 
+               keytype = "ENSEMBL", multiVals = "first"),
+        error = function(e) NULL
+      )
+    })
+    
+    if (!is.null(loc_ens)) {
+      # Map: Original -> Clean -> Symbol
+      tmp_map <- data.table(original_id = ids[is_ensg], clean_id = clean_ensg)
+      tmp_map[, mapped := loc_ens[clean_id]]
+      map_res[tmp_map, on = .(original_id), hgnc_symbol := i.mapped]
+    }
+  }
+  
+  # ---------------------------------------------------------
+  # Strategy 2: Direct Symbol Match (for IDs that are already symbols)
+  # ---------------------------------------------------------
+  missing <- map_res[is.na(hgnc_symbol)]
+  if (nrow(missing) > 0) {
+    direct_hits <- intersect(missing$original_id, valid_symbols)
+    map_res[original_id %in% direct_hits, hgnc_symbol := original_id]
+  }
+  
+  # ---------------------------------------------------------
+  # Strategy 3: Token Mining (for "Epi_39_SEPP1..." garbage)
+  # ---------------------------------------------------------
+  missing <- map_res[is.na(hgnc_symbol)]
+  if (nrow(missing) > 0) {
+    extracted <- extract_valid_symbol_from_tokens(missing$original_id, valid_symbols)
+    
+    # Update table
+    dt_extracted <- data.table(original_id = missing$original_id, extracted = extracted)
+    dt_extracted <- dt_extracted[!is.na(extracted)]
+    
+    if (nrow(dt_extracted) > 0) {
+      map_res[dt_extracted, on = .(original_id), hgnc_symbol := i.extracted]
+    }
+  }
+
+  return(map_res)
+}
+
+## --- Expression Calculation (BPCells) ---
+select_cols_bp <- function(M, cols_idx) {
+  out <- tryCatch(M[, cols_idx, drop = FALSE], error = function(e) NULL)
+  if (!is.null(out)) return(out)
+  BPCells::select_cells(M, cols_idx)
+}
+
+compute_expr_by_cluster_bp <- function(counts_bp, cluster_vec, cols_idx, 
+                                       scale_factor = 1e4, log_base = 2) {
+  M <- select_cols_bp(counts_bp, cols_idx)
+  cl <- cluster_vec[cols_idx]
+  keep <- !is.na(cl) & nzchar(cl)
+  M <- select_cols_bp(M, which(keep))
+  cl <- cl[keep]
+  
+  lib <- BPCells::colSums(M)
+  lib[lib == 0] <- 1
+  sf <- scale_factor / lib
+  M_log1p <- BPCells::log1p_slow(BPCells::multiply_cols(M, sf))
+  
+  cl_levels <- sort(unique(cl))
+  means_list <- lapply(cl_levels, function(k) {
+    Mk <- select_cols_bp(M_log1p, which(cl == k))
+    v <- BPCells::rowMeans(Mk)
+    if (log_base == 2) v <- v / log(2)
+    return(v)
+  })
+  
+  expr_mat <- do.call(cbind, means_list)
+  colnames(expr_mat) <- cl_levels
+  expr_mat
+}
+
+## --- Collapse & Stats Wrapper ---
+collapse_dt_to_symbol_sum_safe <- function(expr_dt, try_biomart = TRUE) {
+  if (is.null(expr_dt)) return(NULL)
+  dt <- copy(expr_dt)
+  setnames(dt, "gene", "orig_gene")
+  
+  origs <- unique(dt$orig_gene)
+  n_orig <- length(origs)
+  
+  # 1. Map IDs
+  map_res <- map_ids_to_symbol_robust(origs, try_biomart = try_biomart)
+  
+  # 2. Assign Symbols
+  map_vec <- setNames(map_res$hgnc_symbol, map_res$original_id)
+  dt[, gene_symbol := map_vec[orig_gene]]
+  
+  # 3. Filter out rows that failed to map (Aggressive cleaning)
+  #    We drop rows where gene_symbol is NA because we cannot link them to PWD anyway.
+  n_unmapped <- sum(is.na(dt$gene_symbol))
+  dt <- dt[!is.na(gene_symbol)]
+  
+  # 4. Collapse (Summation)
+  numeric_cols <- setdiff(names(dt), c("orig_gene", "gene_symbol"))
+  sum_dt <- dt[, lapply(.SD, sum, na.rm = TRUE), by = gene_symbol, .SDcols = numeric_cols]
+  setnames(sum_dt, "gene_symbol", "gene")
+  
+  n_final <- nrow(sum_dt)
+  
+  # 5. Print Stats
+  cat(sprintf("   - ID Mapping: %d input rows -> %d valid symbols found.\n", n_orig, uniqueN(dt$gene_symbol)))
+  cat(sprintf("   - Dropped: %d rows (unmappable garbage/ENSG).\n", n_unmapped))
+  cat(sprintf("   - Collapsed: %d duplicates merged.\n", uniqueN(dt$gene_symbol) - n_final)) # Should be 0 if uniqueN is correct
+  
+  return(sum_dt)
+}
+```
+
+
+## Load PWD data
+
+```{r}
+# --- Helper: Read RDS and Log Stats ---
+read_pwd_with_log <- function(filename, label) {
+  fpath <- file.path(DATA_DIR, filename)
+  
+  if (!file.exists(fpath)) {
+    warning(sprintf("   ! Missing file: %s", filename))
+    return(NULL)
+  }
+  
+  dt <- readRDS(fpath)
+  dt <- as.data.table(dt)
+  
+  # Log gene counts
+  if ("gene" %in% names(dt)) {
+    n_genes <- uniqueN(dt$gene)
+    message(sprintf("   - %s: Loaded %d unique genes (%d rows)", label, n_genes, nrow(dt)))
+  } else {
+    message(sprintf("   - %s: Loaded %d rows (No 'gene' column found)", label, nrow(dt)))
+  }
+  
+  return(dt)
+}
+
+message("Loading PWD Data...")
+
+# 1. Load individual files with logging
+pwd_tss500 <- read_pwd_with_log("pwd_TSS500.rds", "TSS500")
+pwd_pels   <- read_pwd_with_log("pwd_pELS.rds",   "pELS")
+pwd_dels   <- read_pwd_with_log("pwd_dELS.rds",   "dELS")
+
+# 2. Standardization Helper
+prep_pwd <- function(dt, feat_label) {
+  if (is.null(dt)) return(NULL)
+  dt <- as.data.table(dt)
+  if (!"feature" %in% names(dt)) dt[, feature := feat_label]
+  
+  # Ensure required columns exist before selecting
+  req_cols <- c("mean_pwd", "gene", "pair", "feature")
+  if (!all(req_cols %in% names(dt))) return(NULL)
+  
+  dt[, .(wmean_pwd = mean_pwd, gene = gene, pair = pair, feature = feature)]
+}
+
+# 3. Combine
+pwd_all <- rbindlist(list(
+  prep_pwd(pwd_tss500, "TSS500"),
+  prep_pwd(pwd_pels,   "pELS"),
+  prep_pwd(pwd_dels,   "dELS")
+))
+
+message(sprintf("   => Combined Total: %d genes across %d rows (All Pairs)", 
+                uniqueN(pwd_all$gene), nrow(pwd_all)))
+
+# 4. Filter for Normal Pairs only
+pwd_all <- pwd_all[grepl("^Normal", pair)]
+
+message(sprintf("   => Final PWD Data (Normal Only): %d genes across %d rows", 
+                uniqueN(pwd_all$gene), nrow(pwd_all)))
+```
+
+## Processing SCP1162 data
+
+```{r}
+# --- Main Pipeline ---
+build_SCP1162_tables_bp <- function(counts_bp, epi, meta, try_biomart = TRUE) {
+  cells <- colnames(counts_bp)
+  
+  # Align metadata
+  epi2  <- epi[match(cells, NAME), .(ClusterFull)]
+  meta2 <- meta[match(cells, NAME), .(SpecimenType, MMRStatusTumor)]
+  
+  status <- rep(NA_character_, length(cells))
+  status[meta2$SpecimenType == "N"] <- "Normal"
+  status[meta2$SpecimenType == "A"] <- "Adenoma"
+  status[meta2$SpecimenType == "T" & meta2$MMRStatusTumor == "MMRd"] <- "Tumor_MMRd"
+  status[meta2$SpecimenType == "T" & meta2$MMRStatusTumor == "MMRp"] <- "Tumor_MMRp"
+
+  out_raw <- list()
+  for (tag in c("Normal", "Tumor_MMRd", "Tumor_MMRp")) {
+    idx <- which(!is.na(epi2$ClusterFull) & status == tag)
+    if (length(idx) == 0) next
+    
+    message("Processing ", tag, " (", length(idx), " cells)...")
+    expr_mat <- compute_expr_by_cluster_bp(counts_bp, epi2$ClusterFull, idx)
+    expr_dt <- as.data.table(expr_mat, keep.rownames = "gene")
+    out_raw[[tag]] <- list(expr_by_celltype = expr_dt, n_cells = length(idx))
+  }
+
+  # Collapse IDs and Compute Mean/Var across clusters
+  stats_out <- lapply(names(out_raw), function(tag) {
+    x <- out_raw[[tag]]
+    message("Collapsing IDs for ", tag, "...")
+    # 1. Collapse to Symbol
+    expr_sum <- collapse_dt_to_symbol_sum_safe(x$expr_by_celltype, try_biomart = try_biomart)
+    
+    # 2. Compute Mean and Variance across the epithelial clusters (plasticity metrics)
+    mat <- as.matrix(expr_sum[, -1, with = FALSE])
+    stats_dt <- data.table(
+      gene      = expr_sum$gene,
+      mean_expr = rowMeans(mat, na.rm = TRUE),
+      var_expr  = apply(mat, 1L, var, na.rm = TRUE)
+    )
+    
+    list(stats = stats_dt, n_cells = x$n_cells)
+  })
+  names(stats_out) <- names(out_raw)
+
+  return(stats_out)
+}
+
+# --- Execution ---
+counts_bp <- BPCells::open_matrix_dir(file.path(SCP1162_DIR, "bp_counts_dir"))
+epi  <- fread(file.path(SCP1162_DIR, "crc10x_tSNE_cl_Epi.tsv"))
+meta <- fread(file.path(SCP1162_DIR, "metatable_v3_fix_v3.tsv"))
+
+scp1162_results <- build_SCP1162_tables_bp(counts_bp, epi, meta, try_biomart = TRUE) # Set try_biomart=FALSE if offline
+```
+
+## Filter and merge PWD
+
+```{r}
+# Function to print intersection stats
+print_filter_stats <- function(group_name, scp_genes, pwd_genes) {
+  common <- intersect(scp_genes, pwd_genes)
+  n_scp <- length(scp_genes)
+  n_common <- length(common)
+  
+  cat(sprintf("\n--- %s Filter Logic ---\n", group_name))
+  cat(sprintf("Genes in PWD: %d\n", length(pwd_genes)))
+  cat(sprintf("Genes in SCP1162 (%s): %d\n", group_name, n_scp))
+  cat(sprintf("Intersection: %d\n", n_common))
+  cat(sprintf("Filtered out %d genes from SCP1162 not found in PWD data.\n", n_scp - n_common))
+}
+
+merge_pwd_expr <- function(stats_dt, pwd_dt, group_name) {
+  # Print stats
+  print_filter_stats(group_name, unique(stats_dt$gene), unique(pwd_dt$gene))
+  
+  # Inner join on gene
+  merged <- merge(pwd_dt, stats_dt, by = "gene")
+  merged[, Group := group_name]
+  return(merged)
+}
+
+combined_data_list <- list()
+
+if (!is.null(scp1162_results$Normal)) {
+  combined_data_list[["Normal"]] <- merge_pwd_expr(scp1162_results$Normal$stats, pwd_all, "Normal")
+}
+if (!is.null(scp1162_results$Tumor_MMRd)) {
+  combined_data_list[["MMRd"]] <- merge_pwd_expr(scp1162_results$Tumor_MMRd$stats, pwd_all, "Tumor_MMRd")
+}
+if (!is.null(scp1162_results$Tumor_MMRp)) {
+  combined_data_list[["MMRp"]] <- merge_pwd_expr(scp1162_results$Tumor_MMRp$stats, pwd_all, "Tumor_MMRp")
+}
+
+combined_dt <- rbindlist(combined_data_list)
+```
+
+## Visusalization
+
+```{r}
+plot_scp1162_scatter <- function(dt, feature_sel, y_metric, group_sel, top_n = 5) {
+  
+  plot_dt <- dt[feature == feature_sel & Group == group_sel]
+  
+  if (nrow(plot_dt) == 0) return(NULL)
+  
+  y_col <- if (y_metric == "mean") "mean_expr" else "var_expr"
+  y_lab <- if (y_metric == "mean") "Mean Expression (log2 CP10k)" else "Expression Variance"
+  
+  # Identify Top Genes
+  avg_y <- plot_dt[, .(val = mean(get(y_col))), by = gene][order(-val)][1:top_n]
+  label_dt <- plot_dt[gene %in% avg_y$gene]
+
+  p <- ggplot(plot_dt, aes(x = wmean_pwd, y = .data[[y_col]])) +
+    geom_point(alpha = 0.2, size = 1, color = "#2c3e50") +
+    geom_text_repel(data = label_dt, aes(label = gene), size = 3, 
+                    box.padding = 0.5, max.overlaps = Inf, color = "steelblue") +
+    facet_wrap(~pair, scales = "free_x") +
+    theme_bw(base_size = 14) +
+    labs(
+      title = paste0("SCP1162 ", group_sel, " (", feature_sel, "): ", y_lab, " vs PWD"),
+      x = "Methylation Divergence (PWD)",
+      y = y_lab
+    )
+  
+  return(p)
+}
+
+# --- Loop through Groups and Features ---
+features <- c("TSS500", "pELS", "dELS")
+groups <- unique(combined_dt$Group)
+
+for (grp in groups) {
+  cat("\n### Plots for ", grp, "\n")
+  for (feat in features) {
+    print(plot_scp1162_scatter(combined_dt, feat, "mean", grp))
+    print(plot_scp1162_scatter(combined_dt, feat, "var", grp))
+  }
+}
+```
+
+```{r}
+summary_table <- combined_dt[, .(
+  N_Genes = uniqueN(gene),
+  Avg_Expression = mean(mean_expr, na.rm = TRUE),
+  Avg_Variance   = mean(var_expr, na.rm = TRUE),
+  Avg_PWD        = mean(wmean_pwd, na.rm = TRUE)
+), by = .(Group, feature, pair)]
+
+print(summary_table)
+# write.csv(summary_table, file.path(DATA_DIR, "SCP1162_PWD_Summary.csv"), row.names = FALSE)
+```
+
+

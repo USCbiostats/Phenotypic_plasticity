@@ -1,0 +1,323 @@
+---
+title: "Expression_Phenotypic (SCP259)"
+output: html_document
+date: "2026-01-27"
+---
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(Matrix)
+  library(ggplot2)
+  library(ggrepel)
+  library(dplyr)
+  # For ID mapping if needed (optional, but good for robustness)
+  library(org.Hs.eg.db) 
+})
+
+# --- Configuration ---
+DATA_DIR <- "data"
+SCP259_DIR <- file.path(DATA_DIR, "SCP259")
+
+# Epithelial clusters of interest
+EPI_TYPES_SAFE <- c(
+  "Best4_Enterocytes", "Cycling_TA", "Enterocyte_Progenitors", "Enterocytes",
+  "Enteroendocrine", "Goblet", "Immature_Enterocytes_1", "Immature_Enterocytes_2",
+  "Immature_Goblet", "M_cells", "Secretory_TA", "Stem", "TA_1", "TA_2", "Tuft"
+)
+
+# Helper for safe names
+safe_name <- function(s) gsub("[^A-Za-z0-9._-]+", "_", s)
+```
+
+## Loading precomputed data
+
+```{r}
+# --- Helper: Read RDS and Log Stats ---
+read_pwd_with_log <- function(filename, label) {
+  fpath <- file.path(DATA_DIR, filename)
+  
+  if (!file.exists(fpath)) {
+    warning(sprintf("   ! Missing file: %s", filename))
+    return(NULL)
+  }
+  
+  dt <- readRDS(fpath)
+  dt <- as.data.table(dt)
+  
+  # Log gene counts
+  if ("gene" %in% names(dt)) {
+    n_genes <- uniqueN(dt$gene)
+    message(sprintf("   - %s: Loaded %d unique genes (%d rows)", label, n_genes, nrow(dt)))
+  } else {
+    message(sprintf("   - %s: Loaded %d rows (No 'gene' column found)", label, nrow(dt)))
+  }
+  
+  return(dt)
+}
+
+message("Loading PWD Data...")
+
+# 1. Load individual files with logging
+pwd_tss500 <- read_pwd_with_log("pwd_TSS500.rds", "TSS500")
+pwd_pels   <- read_pwd_with_log("pwd_pELS.rds",   "pELS")
+pwd_dels   <- read_pwd_with_log("pwd_dELS.rds",   "dELS")
+
+# 2. Standardization Helper
+prep_pwd <- function(dt, feat_label) {
+  if (is.null(dt)) return(NULL)
+  dt <- as.data.table(dt)
+  if (!"feature" %in% names(dt)) dt[, feature := feat_label]
+  
+  # Ensure required columns exist before selecting
+  req_cols <- c("mean_pwd", "gene", "pair", "feature")
+  if (!all(req_cols %in% names(dt))) return(NULL)
+  
+  dt[, .(wmean_pwd = mean_pwd, gene = gene, pair = pair, feature = feature)]
+}
+
+# 3. Combine
+pwd_all <- rbindlist(list(
+  prep_pwd(pwd_tss500, "TSS500"),
+  prep_pwd(pwd_pels,   "pELS"),
+  prep_pwd(pwd_dels,   "dELS")
+))
+
+message(sprintf("   => Combined Total: %d genes across %d rows (All Pairs)", 
+                uniqueN(pwd_all$gene), nrow(pwd_all)))
+
+# 4. Filter for Normal Pairs only
+pwd_all <- pwd_all[grepl("^Normal", pair)]
+
+message(sprintf("   => Final PWD Data (Normal Only): %d genes across %d rows", 
+                uniqueN(pwd_all$gene), nrow(pwd_all)))
+```
+
+## Expression data processing
+
+```{r}
+# --- Helper: Collapse Duplicate Genes (Summation) ---
+collapse_rows_by_gene <- function(A, genes) {
+  if(length(genes) != nrow(A)) stop("Gene length mismatch")
+  
+  # Map to unique symbols (simple summation for duplicates)
+  # NOTE: ideally we map to HGNC here. Assuming 'genes' vector has symbols.
+  # If 'genes' has Ensembl IDs, we would map to Symbol first, then collapse.
+  # For SCP259, the genes file usually contains Symbols.
+  
+  f <- factor(genes)
+  if (nlevels(f) == length(genes)) return(list(A=A, genes=genes))
+  
+  message("Collapsing ", length(genes), " rows to ", nlevels(f), " unique genes.")
+  
+  M <- Matrix::sparseMatrix(
+    i = as.integer(f), j = seq_along(f), x = 1,
+    dims = c(nlevels(f), length(f))
+  )
+  list(A = as(M %*% A, "dgCMatrix"), genes = levels(f))
+}
+
+# --- Helper: Compute Mean/Var per Group ---
+compute_group_stats <- function(A, genes, cells, cell2type, cell2health, group_name) {
+  
+  # Define Mask
+  if (group_name == "Healthy") {
+    mask <- !is.na(cell2health[cells]) & cell2health[cells] == "Healthy"
+  } else if (group_name == "UC") {
+    mask <- !is.na(cell2health[cells]) & cell2health[cells] != "Healthy" # Assuming UC-like is everything else
+  }
+  
+  ct_safe <- safe_name(cell2type[cells])
+  mask <- mask & !is.na(ct_safe) & ct_safe %in% EPI_TYPES_SAFE
+  
+  idx <- which(mask)
+  message(group_name, ": ", length(idx), " epithelial cells.")
+  if(length(idx) == 0) return(NULL)
+  
+  # Subset Matrix
+  A_sub <- A[, idx, drop=FALSE]
+  
+  # Normalize (CP10k) & Log2
+  lib <- Matrix::colSums(A_sub)
+  lib[lib == 0] <- 1
+  A_sub@x <- A_sub@x * (1e4 / lib[A_sub@j + 1L])
+  A_sub@x <- log2(A_sub@x + 1)
+  
+  # Average across Cell Types (Epithelial)
+  ct_sub <- ct_safe[idx]
+  types <- sort(unique(ct_sub))
+  
+  # We want Gene x CellType matrix
+  means_mat <- matrix(NA, nrow=nrow(A_sub), ncol=length(types))
+  rownames(means_mat) <- genes
+  colnames(means_mat) <- types
+  
+  for(i in seq_along(types)) {
+    k <- which(ct_sub == types[i])
+    if(length(k) > 0) means_mat[,i] <- Matrix::rowMeans(A_sub[, k, drop=FALSE])
+  }
+  
+  # Calculate overall Mean and Variance across these cell types (Plasticity)
+  res <- data.table(
+    gene = genes,
+    mean_expr = rowMeans(means_mat, na.rm=TRUE),
+    var_expr  = apply(means_mat, 1, var, na.rm=TRUE)
+  )
+  
+  # Rename columns for the specific group
+  setnames(res, c("mean_expr", "var_expr"), paste0(c("mean_", "var_"), group_name))
+  return(res)
+}
+```
+
+
+```{r}
+# --- Main SCP259 Loader ---
+build_scp259 <- function(base_dir) {
+  # 1. Read Dictionaries
+  genes <- readLines(file.path(base_dir, "Epi.genes.tsv"))
+  cells <- readLines(file.path(base_dir, "Epi.barcodes2.tsv"))
+  
+  meta_lines <- readLines(file.path(base_dir, "all.meta2.txt"))[-c(1,2)]
+  parts <- strsplit(meta_lines, "\t")
+  valid <- vapply(parts, length, integer(1)) >= 6
+  
+  meta_df <- data.frame(
+    NAME = vapply(parts[valid], `[[`, character(1), 1),
+    Cluster = vapply(parts[valid], `[[`, character(1), 2),
+    Health = vapply(parts[valid], `[[`, character(1), 6)
+  )
+  
+  c2t <- setNames(meta_df$Cluster, meta_df$NAME)
+  c2h <- setNames(meta_df$Health, meta_df$NAME)
+  
+  # 2. Read Matrix
+  A <- readMM(file.path(base_dir, "gene_sorted-Epi.matrix.mtx"))
+  
+  # 3. Collapse Duplicates (Summation)
+  # This handles multiple rows mapping to same symbol by summing counts
+  coll <- collapse_rows_by_gene(A, genes)
+  A <- coll$A
+  genes <- coll$genes
+  
+  # 4. Compute Stats
+  stats_H  <- compute_group_stats(A, genes, cells, c2t, c2h, "Healthy")
+  stats_UC <- compute_group_stats(A, genes, cells, c2t, c2h, "UC")
+  
+  # 5. Merge
+  final_stats <- merge(stats_H, stats_UC, by="gene", all=TRUE)
+  return(final_stats)
+}
+
+# Run Builder
+scp259_data <- build_scp259(SCP259_DIR)
+```
+
+## Filter and merge betwen expression and pwd data
+
+```{r}
+# 1. Filter Logic
+genes_in_pwd <- unique(pwd_all$gene)
+genes_in_scp <- unique(scp259_data$gene)
+
+common_genes <- intersect(genes_in_pwd, genes_in_scp)
+
+cat(sprintf("Genes in PWD: %d\nGenes in SCP259: %d\nIntersection: %d\n", 
+            length(genes_in_pwd), length(genes_in_scp), length(common_genes)))
+
+cat(sprintf("Filtered out %d genes from SCP259 not found in PWD data.\n", 
+            length(genes_in_scp) - length(common_genes)))
+
+# 2. Merge
+# Left join PWD to Expression (keep PWD structure: pair/feature)
+merged_dt <- merge(pwd_all, scp259_data, by="gene", all.x=FALSE, all.y=FALSE)
+
+# Only keep rows with valid expression data for at least one condition
+merged_dt <- merged_dt[!is.na(mean_Healthy) | !is.na(mean_UC)]
+```
+
+## Plotting code
+
+```{r}
+plot_feature_scatter <- function(dt, feature_sel, y_metric, group_label, top_n=5) {
+  
+  # Filter data
+  plot_dt <- dt[feature == feature_sel]
+  
+  # Define columns dynamically
+  y_col <- paste0(y_metric, "_", group_label)
+  
+  # Check if column exists
+  if(!y_col %in% names(plot_dt)) return(NULL)
+  
+  # Remove NAs
+  plot_dt <- plot_dt[!is.na(get(y_col))]
+  
+  # Identify Top Genes (Highest Y-value)
+  top_genes <- plot_dt[, .SD[which.max(get(y_col))], by=pair]
+  top_genes <- unique(top_genes$gene) # simplified for labeling
+  
+  # For labeling, pick top N overall average across pairs
+  avg_y <- plot_dt[, .(mean_y = mean(get(y_col))), by=gene][order(-mean_y)][1:top_n]
+  label_dt <- plot_dt[gene %in% avg_y$gene]
+  
+  # Plot
+  p <- ggplot(plot_dt, aes(x = wmean_pwd, y = .data[[y_col]])) +
+    geom_point(alpha = 0.2, size = 1, color = "#2c3e50") +
+    geom_text_repel(data = label_dt, aes(label = gene), size = 3, 
+                    box.padding = 0.5, max.overlaps = Inf, color = "steelblue") +
+    facet_wrap(~pair, scales = "free_x") +
+    theme_bw(base_size = 14) +
+    labs(
+      title = paste0(group_label, " ", feature_sel, ": ", 
+                     ifelse(y_metric=="mean", "Mean Expression", "Variability"), " vs PWD"),
+      x = "Methylation Divergence (PWD)",
+      y = ifelse(y_metric=="mean", "Mean Expression (log2 CP10k)", "Expression Variance")
+    )
+  
+  return(p)
+}
+
+# --- Healthy Plots ---
+# 1. TSS500
+print(plot_feature_scatter(merged_dt, "TSS500", "mean", "Healthy"))
+print(plot_feature_scatter(merged_dt, "TSS500", "var",  "Healthy"))
+
+# 2. pELS
+print(plot_feature_scatter(merged_dt, "pELS", "mean", "Healthy"))
+print(plot_feature_scatter(merged_dt, "pELS", "var",  "Healthy"))
+
+# 3. dELS
+print(plot_feature_scatter(merged_dt, "dELS", "mean", "Healthy"))
+print(plot_feature_scatter(merged_dt, "dELS", "var",  "Healthy"))
+
+# --- UC Plots ---
+# 1. TSS500
+print(plot_feature_scatter(merged_dt, "TSS500", "mean", "UC"))
+print(plot_feature_scatter(merged_dt, "TSS500", "var",  "UC"))
+
+# 2. pELS
+print(plot_feature_scatter(merged_dt, "pELS", "mean", "UC"))
+print(plot_feature_scatter(merged_dt, "pELS", "var",  "UC"))
+
+# 3. dELS
+print(plot_feature_scatter(merged_dt, "dELS", "mean", "UC"))
+print(plot_feature_scatter(merged_dt, "dELS", "var",  "UC"))
+```
+
+## Basic summary
+
+```{r}
+summary_table <- merged_dt[, .(
+  N_Genes = uniqueN(gene),
+  Avg_Expression_Healthy = mean(mean_Healthy, na.rm=TRUE),
+  Avg_Variance_Healthy   = mean(var_Healthy, na.rm=TRUE),
+  Avg_Expression_UC      = mean(mean_UC, na.rm=TRUE),
+  Avg_Variance_UC        = mean(var_UC, na.rm=TRUE),
+  Avg_PWD                = mean(wmean_pwd, na.rm=TRUE)
+), by = .(feature, pair)]
+
+print(summary_table)
+#write.csv(summary_table, file.path(DATA_DIR, "SCP259_PWD_Summary.csv"), row.names=FALSE)
+```
