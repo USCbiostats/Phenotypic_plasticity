@@ -281,22 +281,27 @@ if (file.exists(path_tf)) {
 ## PWD calculation
 
 ```{r}
+# ==============================================================================
+# 4. PWD Calculation Engine
+# ==============================================================================
+
 # --- Configuration for PWD ---
-MIN_COV <- 8L
+MIN_COV  <- 8L
 MIN_CPGS <- 1L
 
 # --- Function: Read Methylation BED ---
 read_methyl_bed <- function(path) {
   # Expects: chr, start, end, beta, cov, meth, unmeth
+  # Reading only essential columns: chr, start, end, beta, cov
   d <- fread(path, select=1:5, col.names=c("chr","start","end","beta","cov"))
   d <- d[chr %in% STD_CHR & cov >= MIN_COV]
-  d[, start := start + 1L] # 1-based
+  d[, start := start + 1L] # Convert 0-based BED to 1-based R
   setkey(d, chr, start)
   return(d)
 }
 
 # --- Function: Calculate Gene-Level PWD ---
-# interval_dt must have: chr, start, end, gene (or nearest_gene)
+# interval_dt must have: chr, start, end, and the column specified by gene_col
 calc_gene_pwd_pair <- function(pathA, pathB, interval_dt, gene_col="gene") {
   
   # 1. Read Data
@@ -308,55 +313,59 @@ calc_gene_pwd_pair <- function(pathA, pathB, interval_dt, gene_col="gene") {
   if (nrow(common) == 0) return(NULL)
   
   # 3. Overlap with Intervals (Iterate by Chromosome to save RAM)
+  #    This replaces the "interval_chunk" logic with a "chromosome chunk" logic.
   chrs <- intersect(unique(interval_dt$chr), unique(common$chr))
   res_list <- list()
   
   for (k in chrs) {
-    # Subset
+    # Subset data for this chromosome
     ints_k <- interval_dt[chr == k]
     cpgs_k <- common[chr == k]
     
     if (nrow(ints_k) == 0 || nrow(cpgs_k) == 0) next
     
-    # Fast overlap (foverlaps requires keys)
-    # CpGs are points: start=end
-    cpgs_k[, end := start]
+    # Fast overlap preparation
+    cpgs_k[, end := start] # CpGs are points
     setkey(cpgs_k, chr, start, end)
     setkey(ints_k, chr, start, end)
     
-    # Overlap
+    # Overlap (nomatch=0 drops non-overlapping CpGs)
     ov <- foverlaps(cpgs_k, ints_k, nomatch=0L)
     
-    # Calculate PWD per CpG: |BetaA - BetaB|
+    if (nrow(ov) == 0) next
+    
+    # Calculate PWD per CpG site: |BetaA - BetaB|
     ov[, pwd_site := abs(beta_A - beta_B)]
     
-    # Aggregate to Gene Level
-    # Weighted Mean: We weight by number of CpGs? 
-    # Usually: Mean of PWDs in the gene.
-    # If the interval_dt has multiple intervals per gene (e.g. cCREs),
-    # this aggregation pools ALL CpGs in ALL intervals for that gene.
-    
+    # Aggregate to Gene Level (Summing PWDs and counts)
+    # FIX: Use 'by = c(gene_col)' to group by the string name of the column
     agg <- ov[, .(
       sum_pwd = sum(pwd_site, na.rm=TRUE),
       n_cpg   = .N
-    ), by = get(gene_col)] # Group by Gene
+    ), by = c(gene_col)] 
     
     res_list[[k]] <- agg
   }
   
-  # Combine chromosomes and re-aggregate (since a gene might span chrs, though unlikely)
+  if (length(res_list) == 0) return(NULL)
+  
+  # 4. Combine Chromosomes and Re-aggregate
+  # (Re-aggregation ensures genes spanning chromosomes, if any, are summed correctly)
   final <- rbindlist(res_list)
+  
   final <- final[, .(
     mean_pwd = sum(sum_pwd) / sum(n_cpg),
     n_cpg    = sum(n_cpg)
-  ), by = get] # 'get' is the gene column
+  ), by = c(gene_col)]
   
-  setnames(final, "get", "gene")
+  # Standardize the gene column name to "gene" for downstream compatibility
+  setnames(final, gene_col, "gene")
+  
   return(final)
 }
 
-# --- Wrapper: Run All Pairs for an Interval Set ---
-run_pwd_pipeline <- function(interval_dt, feature_name, pairs, bed_paths, gene_col="gene") {
+# --- Wrapper: Run All Pairs (Renamed to match old naming convention) ---
+run_all_pairs_one_interval_dt <- function(intervals_dt, feature_name, pairs, bed_paths, gene_col="gene") {
   
   all_res <- list()
   
@@ -366,30 +375,32 @@ run_pwd_pipeline <- function(interval_dt, feature_name, pairs, bed_paths, gene_c
     
     message("  Processing ", feature_name, " : ", p_name)
     
-    res <- calc_gene_pwd_pair(bed_paths[[s1]], bed_paths[[s2]], interval_dt, gene_col)
+    # Calculate PWD for this pair
+    res <- calc_gene_pwd_pair(bed_paths[[s1]], bed_paths[[s2]], intervals_dt, gene_col)
     
     if (!is.null(res)) {
       res[, pair := p_name]
       res[, feature := feature_name]
       all_res[[p_name]] <- res
     }
-    gc() # Clean memory
+    gc() # Aggressively clean memory after each pair
   }
   
   out <- rbindlist(all_res)
   
-  # Save immediately
-  save_path <- paste0("data/pwd_", feature_name, ".rds")
-  saveRDS(out, save_path)
+  # Save immediately to disk (checkpointing)
+  if (nrow(out) > 0) {
+    save_path <- paste0("data/pwd_", feature_name, ".rds")
+    saveRDS(out, save_path)
+  }
   
   return(out)
 }
 ```
 
+
 ## Exercution
 ```{r}
-# --- Define Sample Map ---
-# Update paths to match your local files
 bed_paths <- c(
   EN = "data/EN.bed", IN = "data/IN.bed", JN = "data/JN.bed",
   PA = "data/PA.bed", PB = "data/PB.bed",
@@ -416,39 +427,50 @@ pairs <- list(
 
 # --- Run Calculations ---
 
-# 1. Direct Gene Features
+# 1. Direct Gene Features (use gene_col="gene")
 message("Running PWD for TSS500...")
-pwd_tss500  <- run_pwd_pipeline(iv_tss500,  "TSS500",  pairs, bed_paths, "gene")
+pwd_tss500  <- run_all_pairs_one_interval_dt(iv_tss500,  "TSS500",  pairs, bed_paths, gene_col="gene")
 
 message("Running PWD for TSS1000...")
-pwd_tss1000 <- run_pwd_pipeline(iv_tss1000, "TSS1000", pairs, bed_paths, "gene")
+pwd_tss1000 <- run_all_pairs_one_interval_dt(iv_tss1000, "TSS1000", pairs, bed_paths, gene_col="gene")
 
 message("Running PWD for TxBody...")
-pwd_tx      <- run_pwd_pipeline(iv_tx,      "tx",      pairs, bed_paths, "gene")
+pwd_tx      <- run_all_pairs_one_interval_dt(iv_tx,      "tx",      pairs, bed_paths, gene_col="gene")
 
 message("Running PWD for CDS...")
-pwd_cds     <- run_pwd_pipeline(iv_cds,     "cds",     pairs, bed_paths, "gene")
+pwd_cds     <- run_all_pairs_one_interval_dt(iv_cds,     "cds",     pairs, bed_paths, gene_col="gene")
 
-# 2. Genomic Features (Mapped to Nearest Gene)
+# 2. Genomic Features (Mapped to Nearest Gene -> use gene_col="nearest_gene")
 
 # pELS / dELS (Split from cCREs)
-# Ensure column name matches your BED file's class column. Assuming 'ccre_group' or 'V10'
-if ("ccre_group" %in% names(dt_ccre_all)) {
-  iv_pels <- dt_ccre_all[ccre_group == "pELS"]
-  iv_dels <- dt_ccre_all[ccre_group == "dELS"]
+# Note: dt_ccre_mapped was created in the previous block.
+if (exists("dt_ccre_mapped") && nrow(dt_ccre_mapped) > 0) {
+  # The column holding 'pELS'/'dELS' was named 'feature_class' in the previous step
+  iv_pels <- dt_ccre_mapped[feature_class == "pELS"]
+  iv_dels <- dt_ccre_mapped[feature_class == "dELS"]
   
-  message("Running PWD for pELS...")
-  pwd_pels <- run_pwd_pipeline(iv_pels, "pELS", pairs, bed_paths, "nearest_gene")
+  if (nrow(iv_pels) > 0) {
+    message("Running PWD for pELS...")
+    pwd_pels <- run_all_pairs_one_interval_dt(iv_pels, "pELS", pairs, bed_paths, gene_col="nearest_gene")
+  }
   
-  message("Running PWD for dELS...")
-  pwd_dels <- run_pwd_pipeline(iv_dels, "dELS", pairs, bed_paths, "nearest_gene")
+  if (nrow(iv_dels) > 0) {
+    message("Running PWD for dELS...")
+    pwd_dels <- run_all_pairs_one_interval_dt(iv_dels, "dELS", pairs, bed_paths, gene_col="nearest_gene")
+  }
 }
 
-message("Running PWD for CpG Islands...")
-pwd_cgi <- run_pwd_pipeline(dt_cgi, "CGI", pairs, bed_paths, "nearest_gene")
+# CpG Islands
+if (exists("dt_cgi_mapped") && nrow(dt_cgi_mapped) > 0) {
+  message("Running PWD for CpG Islands...")
+  pwd_cgi <- run_all_pairs_one_interval_dt(dt_cgi_mapped, "CGI", pairs, bed_paths, gene_col="nearest_gene")
+}
 
-message("Running PWD for TFs...")
-pwd_tf  <- run_pwd_pipeline(dt_tf,  "TF",  pairs, bed_paths, "nearest_gene")
+# Transcription Factors
+if (exists("dt_tf_mapped") && nrow(dt_tf_mapped) > 0) {
+  message("Running PWD for TFs...")
+  pwd_tf  <- run_all_pairs_one_interval_dt(dt_tf_mapped,  "TF",  pairs, bed_paths, gene_col="nearest_gene")
+}
 ```
 
 
@@ -475,7 +497,47 @@ summary_stats <- master_summary_tbl[, .(
 ), by = .(feature, pair)]
 
 print(summary_stats)
-write_csv(summary_stats, "data/pwd_summary_stats.csv")
+
+# ==============================================================================
+# Visualization
+# ==============================================================================
+library(ggplot2)
+
+# --- A) Prepare Factors for Plotting ---
+
+# 1. Order 'pair' by the order defined in the 'pairs' list (Normal -> Adenoma -> CRC)
+#    Otherwise ggplot defaults to alphabetical.
+pair_levels <- names(pairs)
+summary_stats[, pair := factor(pair, levels = pair_levels)]
+
+# 2. Order 'feature' logically (CGI -> Promoter -> Enhancer -> Body)
+#    Adjust this list based on exactly what features you ran.
+feat_levels_priority <- c("CGI", "TSS500", "TSS1000", "pELS", "dELS", "TF", "cds", "tx")
+# Keep only levels that actually exist in the data
+actual_levels <- intersect(feat_levels_priority, unique(summary_stats$feature))
+summary_stats[, feature := factor(feature, levels = actual_levels)]
+
+# --- B) Generate Plot ---
+
+p_trend <- ggplot(summary_stats, aes(x = pair, y = Mean_PWD, colour = feature, group = feature)) +
+  # Lines connect the SAME feature across different pairs
+  geom_line(linewidth = 0.8, alpha = 0.6) + 
+  # Points show the actual value
+  geom_point(size = 3, alpha = 0.9) +
+  labs(
+    x = NULL,
+    y = "Mean PWD (mean |Δβ|)",
+    colour = "Genomic Context",
+    title = "Methylation Conservation Across Sample Pairs",
+    subtitle = "Trend of divergence across Normal, Adenoma, and CRC pairs"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+
+print(p_trend)
 
 message("Processing Complete. All gene-level PWD files saved to /data.")
 ```
